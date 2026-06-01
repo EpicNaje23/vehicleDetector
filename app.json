@@ -9,6 +9,9 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
+      "infoPlist": {
+        "UIBackgroundModes": ["audio"]
+      },
       "supportsTablet": true
     },
     "android": {
@@ -27,6 +30,26 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow $(PRODUCT_NAME) to record audio and send it to your server."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to record video sessions for dataset collection.",
+          "microphonePermission": "Allow $(PRODUCT_NAME) to record audio with dataset videos.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow $(PRODUCT_NAME) to save where dataset recordings were collected."
+        }
+      ],
       [
         "expo-splash-screen",
         {

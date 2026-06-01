@@ -16,3 +16,10 @@ A React Native / Expo app that classifies vehicles using only their engine sound
 
 ## Getting Started
 
+Set `EXPO_PUBLIC_AUDIO_API_URL` before starting the app so uploads know where to go:
+
+```bash
+EXPO_PUBLIC_AUDIO_API_URL=http://192.168.x.x:8000/predict pnpm start
+```
+
+The app records audio with `expo-audio`, uploads it as multipart form data under the `file` field, and renders either a JSON or plain-text response from the server.
