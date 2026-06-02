@@ -17,7 +17,9 @@ export default function RootLayout() {
       <Stack
         screenOptions={{
           headerShown: false,
-          contentStyle: { backgroundColor: "#121212" },
+          contentStyle: { backgroundColor: "#05060A" },
+          animation: "fade",
+          animationDuration: 180,
         }}
       />
     </SafeAreaProvider>

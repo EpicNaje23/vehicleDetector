@@ -7,7 +7,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "eslint app components convex/dataset.ts convex/schema.ts convex/auth.config.ts"
   },
   "dependencies": {
     "@clerk/clerk-expo": "^2.19.31",

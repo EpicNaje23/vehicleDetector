@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
   Easing,
+  Modal,
   ScrollView,
   StyleSheet,
   Text,
@@ -11,7 +12,6 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
-import { Link } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import {
   RecordingPresets,
@@ -20,31 +20,19 @@ import {
   useAudioRecorder,
   useAudioRecorderState,
 } from 'expo-audio';
-
-const STATUS_COPY = {
-  idle: {
-    eyebrow: 'Ready to record',
-    title: 'Capture audio',
-    hint: 'Record a short sample, then send it to your server.',
-    badge: 'ready',
-  },
-  recording: {
-    eyebrow: 'Microphone live',
-    title: 'Recording…',
-    hint: 'Tap again to stop and prepare the upload.',
-    badge: 'recording',
-  },
-  recorded: {
-    eyebrow: 'Clip saved',
-    title: 'Ready to send',
-    hint: 'Review the endpoint and upload the recording.',
-    badge: 'recorded',
-  },
-};
+import { BottomNav, BOTTOM_NAV_HEIGHT } from '@/components/BottomNav';
 
 const DEFAULT_SERVER_URL = process.env.EXPO_PUBLIC_AUDIO_API_URL ?? '';
 
-type PermissionState = 'unknown' | 'granted' | 'denied';
+type Prediction = {
+  id: string;
+  vehicle: string;
+  confidence?: string;
+  probabilities?: Record<string, number>;
+  waveformBars: number[];
+  createdAt: number;
+  raw: string;
+};
 
 function formatDuration(durationMillis: number) {
   const totalSeconds = Math.max(0, Math.floor(durationMillis / 1000));
@@ -82,19 +70,136 @@ function getMimeType(fileName: string) {
   return 'audio/mp4';
 }
 
+function stringifyResponse(body: unknown) {
+  if (typeof body === 'string') {
+    return body;
+  }
+
+  try {
+    return JSON.stringify(body, null, 2);
+  } catch {
+    return String(body);
+  }
+}
+
+function findNestedValue(value: unknown, keys: string[]): unknown {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  for (const key of keys) {
+    const found = record[key];
+    if (typeof found === 'string' || typeof found === 'number') {
+      return found;
+    }
+  }
+
+  for (const nested of Object.values(record)) {
+    const found = findNestedValue(nested, keys);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+
+  return undefined;
+}
+
+function getProbabilityMap(value: unknown) {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const probabilities = (value as Record<string, unknown>).probabilities;
+  if (!probabilities || typeof probabilities !== 'object') {
+    return undefined;
+  }
+
+  const entries = Object.entries(probabilities as Record<string, unknown>)
+    .map(([label, score]) => [label, Number(score)] as const)
+    .filter(([, score]) => Number.isFinite(score));
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function generateWaveformBars(seed: string, count = 42) {
+  let hash = 0;
+
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+  }
+
+  return Array.from({ length: count }, (_, index) => {
+    const wave = Math.sin((index / count) * Math.PI * 4) * 0.28;
+    hash = (hash * 1664525 + 1013904223) >>> 0;
+    const random = (hash % 1000) / 1000;
+
+    return Math.max(0.18, Math.min(1, 0.46 + wave + random * 0.38));
+  });
+}
+
+function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
+  const raw = stringifyResponse(body);
+  let parsed = body;
+
+  if (typeof body === 'string') {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = body;
+    }
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const vehicle = findNestedValue(parsed, [
+      'vehicle',
+      'vehicleType',
+      'vehicle_type',
+      'predicted_class',
+      'class',
+      'label',
+      'prediction',
+      'predicted',
+      'result',
+      'name',
+    ]);
+    const confidence = findNestedValue(parsed, [
+      'confidence',
+      'score',
+      'probability',
+      'prob',
+      'accuracy',
+    ]);
+
+    return {
+      vehicle: vehicle ? String(vehicle) : 'Prediction unavailable',
+      confidence: confidence ? String(confidence) : undefined,
+      probabilities: getProbabilityMap(parsed),
+      waveformBars: generateWaveformBars(raw),
+      raw,
+    };
+  }
+
+  const cleaned = raw.trim();
+  return {
+    vehicle: cleaned || 'Prediction unavailable',
+    waveformBars: generateWaveformBars(cleaned || raw),
+    raw: cleaned || raw,
+  };
+}
+
 export default function HomeScreen() {
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder, 200);
-  const [permissionState, setPermissionState] = useState<PermissionState>('unknown');
-  const [recordingUri, setRecordingUri] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [serverResponse, setServerResponse] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
+  const [recentPredictions, setRecentPredictions] = useState<Prediction[]>([]);
+  const [selectedPrediction, setSelectedPrediction] = useState<Prediction | null>(null);
   const pulse = useRef(new Animated.Value(0)).current;
   const insets = useSafeAreaInsets();
   const isRecording = recorderState.isRecording;
-  const hasRecording = Boolean(recordingUri);
 
   useEffect(() => {
     let loop: Animated.CompositeAnimation | null = null;
@@ -127,27 +232,77 @@ export default function HomeScreen() {
     };
   }, [isRecording, pulse]);
 
-  const status = isRecording
-    ? STATUS_COPY.recording
-    : hasRecording
-      ? STATUS_COPY.recorded
-      : STATUS_COPY.idle;
+  const statusText = useMemo(() => {
+    if (isRecording) {
+      return 'Listening…';
+    }
+
+    if (isPreparing) {
+      return 'Preparing…';
+    }
+
+    if (isSubmitting) {
+      return 'Predicting…';
+    }
+
+    return 'Tap to listen';
+  }, [isPreparing, isRecording, isSubmitting]);
 
   const ensureMicrophonePermission = async () => {
     const permission = await requestRecordingPermissionsAsync();
-    setPermissionState(permission.granted ? 'granted' : 'denied');
     return permission.granted;
+  };
+
+  const uploadRecording = async (recordingUri: string, durationMillis: number) => {
+    if (!DEFAULT_SERVER_URL.trim()) {
+      throw new Error('Missing EXPO_PUBLIC_AUDIO_API_URL for predictions.');
+    }
+
+    const fileName = getFileName(recordingUri);
+    const formData = new FormData();
+
+    formData.append('file', {
+      uri: recordingUri,
+      name: fileName,
+      type: getMimeType(fileName),
+    } as unknown as Blob);
+    formData.append('source', 'mobile-app');
+    formData.append('durationMillis', String(durationMillis));
+
+    const response = await fetch(DEFAULT_SERVER_URL.trim(), {
+      method: 'POST',
+      body: formData,
+    });
+
+    const contentType = response.headers.get('content-type') ?? '';
+    const body = contentType.includes('application/json') ? await response.json() : await response.text();
+
+    if (!response.ok) {
+      throw new Error(stringifyResponse(body) || `Prediction failed with status ${response.status}.`);
+    }
+
+    const prediction = buildPrediction(body);
+    const nextPrediction = {
+      ...prediction,
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      createdAt: Date.now(),
+    };
+
+    setRecentPredictions((current) => [
+      nextPrediction,
+      ...current,
+    ].slice(0, 20));
+    setSelectedPrediction(nextPrediction);
   };
 
   const startRecording = async () => {
     try {
       setErrorMessage(null);
-      setServerResponse(null);
       setIsPreparing(true);
 
       const granted = await ensureMicrophonePermission();
       if (!granted) {
-        setErrorMessage('Microphone permission was denied.');
+        setErrorMessage('Microphone permission is required to predict a vehicle.');
         return;
       }
 
@@ -157,7 +312,6 @@ export default function HomeScreen() {
       });
       await recorder.prepareToRecordAsync();
       recorder.record();
-      setRecordingUri(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to start recording.';
       setErrorMessage(message);
@@ -166,27 +320,29 @@ export default function HomeScreen() {
     }
   };
 
-  const stopRecording = async () => {
+  const stopAndPredict = async () => {
     try {
       setErrorMessage(null);
       setIsPreparing(true);
 
       await recorder.stop();
-      await setAudioModeAsync({
-        allowsRecording: false,
-      });
+      await setAudioModeAsync({ allowsRecording: false });
 
-      const nextUri = recorder.uri ?? recorderState.url;
-      if (!nextUri) {
-        throw new Error('Recording finished, but no audio file was created.');
+      const recordingUri = recorder.uri ?? recorderState.url;
+      if (!recordingUri) {
+        setErrorMessage('Recording finished, but no audio file was created.');
+        return;
       }
 
-      setRecordingUri(nextUri);
+      setIsPreparing(false);
+      setIsSubmitting(true);
+      await uploadRecording(recordingUri, recorderState.durationMillis);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to stop recording.';
+      const message = error instanceof Error ? error.message : 'Unable to predict vehicle.';
       setErrorMessage(message);
     } finally {
       setIsPreparing(false);
+      setIsSubmitting(false);
     }
   };
 
@@ -196,90 +352,18 @@ export default function HomeScreen() {
     }
 
     if (isRecording) {
-      await stopRecording();
+      await stopAndPredict();
       return;
     }
 
     await startRecording();
   };
 
-  const uploadRecording = async () => {
-    if (!recordingUri) {
-      setErrorMessage('Record audio before uploading.');
-      return;
-    }
-
-    if (!DEFAULT_SERVER_URL.trim()) {
-      setErrorMessage('Missing EXPO_PUBLIC_AUDIO_API_URL for uploads.');
-      return;
-    }
-
-    try {
-      setErrorMessage(null);
-      setServerResponse(null);
-      setIsSubmitting(true);
-
-      const fileName = getFileName(recordingUri);
-      const formData = new FormData();
-
-      formData.append('file', {
-        uri: recordingUri,
-        name: fileName,
-        type: getMimeType(fileName),
-      } as unknown as Blob);
-      formData.append('source', 'mobile-app');
-      formData.append('durationMillis', String(recorderState.durationMillis));
-
-      const response = await fetch(DEFAULT_SERVER_URL.trim(), {
-        method: 'POST',
-        body: formData,
-      });
-
-      const contentType = response.headers.get('content-type') ?? '';
-      const body = contentType.includes('application/json')
-        ? JSON.stringify(await response.json(), null, 2)
-        : await response.text();
-
-      if (!response.ok) {
-        throw new Error(body || `Upload failed with status ${response.status}.`);
-      }
-
-      setServerResponse(body || 'Upload complete. The server returned an empty body.');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to upload recording.';
-      setErrorMessage(message);
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const clearRecording = () => {
-    if (isRecording || isPreparing || isSubmitting) {
-      return;
-    }
-
-    setRecordingUri(null);
-    setServerResponse(null);
-    setErrorMessage(null);
-  };
-
   return (
-    <View
-      style={[
-        styles.safeArea,
-        { paddingTop: insets.top, paddingBottom: insets.bottom },
-      ]}
-    >
+    <View style={[styles.safeArea, { paddingTop: insets.top }]}> 
       <StatusBar style="light" />
-      <View style={styles.screen}>
+      <View style={[styles.screen, { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 18 }]}> 
         <Text style={styles.heading}>CarZam</Text>
-        <Text style={styles.subtitle}>Record audio, send it to your server, and show the reply here.</Text>
-        <Link href={'/collect' as never} asChild>
-          <TouchableOpacity activeOpacity={0.85} style={styles.collectionLink}>
-            <Ionicons name="videocam-outline" size={17} color="#38BDF8" />
-            <Text style={styles.collectionLinkText}>Collect dataset sessions</Text>
-          </TouchableOpacity>
-        </Link>
 
         <View style={styles.captureSection}>
           <Animated.View
@@ -296,104 +380,147 @@ export default function HomeScreen() {
                 ],
                 opacity: pulse.interpolate({
                   inputRange: [0, 1],
-                  outputRange: [0.35, 0],
+                  outputRange: [0.34, 0],
                 }),
               },
             ]}
           />
           <TouchableOpacity
-            activeOpacity={0.85}
+            activeOpacity={0.86}
             style={[styles.listenButton, isRecording && styles.listenButtonActive]}
             onPress={toggleRecording}
           >
-            <View style={styles.listenIconRow}>
-              <Ionicons name="mic-outline" size={24} color="#FFFFFF" />
-              <Text style={styles.listenBadge}>{status.badge}</Text>
-            </View>
-            <Text style={styles.statusEyebrow}>{status.eyebrow}</Text>
-            <Text style={styles.listenTitle}>{status.title}</Text>
-            <Text style={styles.listenHint}>{status.hint}</Text>
-            <Text style={styles.durationText}>
-              {isRecording || hasRecording ? formatDuration(recorderState.durationMillis) : '00:00'}
-            </Text>
-            <View style={styles.ctaPill}>
-              {isPreparing ? (
-                <ActivityIndicator size="small" color="#0F172A" />
-              ) : (
-                <Ionicons
-                  name={isRecording ? 'stop' : 'radio-button-on'}
-                  size={18}
-                  color="#0F172A"
-                />
-              )}
-              <Text style={styles.ctaText}>{isRecording ? 'Stop recording' : 'Start recording'}</Text>
-            </View>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.actionsRow}>
-          <TouchableOpacity
-            activeOpacity={0.85}
-            disabled={!hasRecording || isRecording || isSubmitting || isPreparing}
-            onPress={uploadRecording}
-            style={[
-              styles.secondaryButton,
-              (!hasRecording || isRecording || isSubmitting || isPreparing) && styles.buttonDisabled,
-            ]}
-          >
-            {isSubmitting ? (
-              <ActivityIndicator size="small" color="#F8FAFC" />
+            {isPreparing || isSubmitting ? (
+              <ActivityIndicator size="large" color="#FFFFFF" />
             ) : (
-              <>
-                <Ionicons name="cloud-upload-outline" size={18} color="#F8FAFC" />
-                <Text style={styles.secondaryButtonText}>Send to server</Text>
-              </>
+              <Ionicons name={isRecording ? 'stop' : 'mic-outline'} size={42} color="#FFFFFF" />
             )}
+            <Text style={styles.listenTitle}>{statusText}</Text>
+            <Text style={styles.durationText}>{isRecording ? formatDuration(recorderState.durationMillis) : '00:00'}</Text>
           </TouchableOpacity>
-
-          <TouchableOpacity
-            activeOpacity={0.85}
-            disabled={!hasRecording || isRecording || isSubmitting || isPreparing}
-            onPress={clearRecording}
-            style={[
-              styles.ghostButton,
-              (!hasRecording || isRecording || isSubmitting || isPreparing) && styles.buttonDisabled,
-            ]}
-          >
-            <Ionicons name="refresh-outline" size={18} color="#CBD5E1" />
-            <Text style={styles.ghostButtonText}>Reset</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.metaRow}>
-          <View style={styles.metaPill}>
-            <Text style={styles.metaLabel}>Permission</Text>
-            <Text style={styles.metaValue}>{permissionState}</Text>
-          </View>
-          <View style={styles.metaPill}>
-            <Text style={styles.metaLabel}>File</Text>
-            <Text numberOfLines={1} style={styles.metaValue}>
-              {recordingUri ? getFileName(recordingUri) : 'none'}
-            </Text>
-          </View>
         </View>
 
         {errorMessage ? (
           <View style={styles.messageBoxError}>
-            <Text style={styles.messageTitle}>Error</Text>
+            <Ionicons name="alert-circle-outline" size={18} color="#FECACA" />
             <Text style={styles.messageBody}>{errorMessage}</Text>
           </View>
         ) : null}
 
-        <View style={styles.responseSection}>
-          <Text style={styles.panelLabel}>Server response</Text>
-          <ScrollView contentContainerStyle={styles.responseBody} style={styles.responseBox}>
-            <Text style={styles.responseText}>
-              {serverResponse ?? 'The server response will appear here after upload.'}
-            </Text>
+        <View style={styles.recentSection}>
+          <View style={styles.recentHeader}>
+            <Text style={styles.recentTitle}>Recently predicted</Text>
+          </View>
+          <ScrollView
+            horizontal
+            style={styles.recentList}
+            contentContainerStyle={styles.recentListContent}
+            showsHorizontalScrollIndicator={false}
+            showsVerticalScrollIndicator={false}
+          >
+            {recentPredictions.length === 0 ? (
+              <View style={styles.emptyState}>
+                <Ionicons name="car-sport-outline" size={24} color="#64748B" />
+                <Text style={styles.emptyText}>Predictions will appear here.</Text>
+              </View>
+            ) : (
+              recentPredictions.map((prediction) => (
+                <TouchableOpacity
+                  key={prediction.id}
+                  activeOpacity={0.84}
+                  onPress={() => setSelectedPrediction(prediction)}
+                  style={styles.predictionRow}
+                >
+                  <View style={styles.predictionIcon}>
+                    <Ionicons name="car-sport-outline" size={18} color="#38BDF8" />
+                  </View>
+                  <View style={styles.predictionTextBlock}>
+                    <Text numberOfLines={1} style={styles.predictionVehicle}>{prediction.vehicle}</Text>
+                    <Text numberOfLines={1} style={styles.predictionRaw}>{prediction.confidence ? `Confidence ${prediction.confidence}` : prediction.raw}</Text>
+                  </View>
+                  <Text style={styles.predictionTime}>{new Date(prediction.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</Text>
+                </TouchableOpacity>
+              ))
+            )}
           </ScrollView>
         </View>
       </View>
+      <BottomNav />
+      <Modal
+        animationType="slide"
+        visible={selectedPrediction !== null}
+        presentationStyle="pageSheet"
+        onRequestClose={() => setSelectedPrediction(null)}
+      >
+        <View style={styles.modalScreen}>
+          <TouchableOpacity
+            activeOpacity={0.82}
+            onPress={() => setSelectedPrediction(null)}
+            style={[styles.modalCloseButton, { top: insets.top + 14 }]}
+          >
+            <Ionicons name="close" size={24} color="#F8FAFC" />
+          </TouchableOpacity>
+
+          {selectedPrediction ? (
+            <ScrollView
+              contentContainerStyle={[
+                styles.modalContent,
+                {
+                  paddingTop: insets.top + 88,
+                  paddingBottom: Math.max(insets.bottom, 20) + 32,
+                },
+              ]}
+              showsVerticalScrollIndicator={false}
+            >
+              <View style={styles.modalIcon}>
+                <Ionicons name="car-sport-outline" size={42} color="#38BDF8" />
+              </View>
+              <Text style={styles.modalLabel}>Prediction result</Text>
+              <Text numberOfLines={2} adjustsFontSizeToFit style={styles.modalVehicle}>
+                {selectedPrediction.vehicle}
+              </Text>
+              {selectedPrediction.confidence ? (
+                <Text style={styles.modalConfidence}>Confidence {selectedPrediction.confidence}</Text>
+              ) : null}
+              <Text style={styles.modalTime}>
+                {new Date(selectedPrediction.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </Text>
+
+              <View style={styles.detailSection}>
+                <Text style={styles.detailTitle}>Waveform</Text>
+                <View style={styles.waveformCard}>
+                  {selectedPrediction.waveformBars.map((height, index) => (
+                    <View
+                      key={`${selectedPrediction.id}-wave-${index}`}
+                      style={[styles.waveformBar, { height: 18 + height * 66 }]}
+                    />
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.detailSection}>
+                <Text style={styles.detailTitle}>Class scores</Text>
+                <View style={styles.scoreCard}>
+                  {Object.entries(selectedPrediction.probabilities ?? {})
+                    .sort(([, left], [, right]) => right - left)
+                    .map(([label, score]) => (
+                      <View key={label} style={styles.scoreRow}>
+                        <Text style={styles.scoreLabel}>{label}</Text>
+                        <View style={styles.scoreTrack}>
+                          <View style={[styles.scoreFill, { width: `${Math.round(score * 100)}%` }]} />
+                        </View>
+                        <Text style={styles.scoreValue}>{Math.round(score * 100)}%</Text>
+                      </View>
+                    ))}
+                  {!selectedPrediction.probabilities ? (
+                    <Text style={styles.scoreEmpty}>No class scores returned.</Text>
+                  ) : null}
+                </View>
+              </View>
+            </ScrollView>
+          ) : null}
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -405,53 +532,22 @@ const styles = StyleSheet.create({
   },
   screen: {
     flex: 1,
-    padding: 24,
+    paddingHorizontal: 24,
     alignItems: 'center',
-    justifyContent: 'flex-start',
-    paddingTop: "20%",
-  },
-  brand: {
-    color: '#6C7394',
-    fontSize: 14,
-    textTransform: 'uppercase',
-    letterSpacing: 2,
-    marginBottom: 6,
+    paddingTop: 26,
   },
   heading: {
     color: '#F8FAFC',
-    fontSize: 28,
-    fontWeight: '700',
-  },
-  subtitle: {
-    color: '#98A1C1',
-    fontSize: 15,
-    textAlign: 'center',
-    marginTop: 6,
-    marginBottom: 12,
-    maxWidth: 320,
-  },
-  collectionLink: {
-    minHeight: 40,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(56, 189, 248, 0.35)',
-    backgroundColor: 'rgba(14, 165, 233, 0.10)',
-    paddingHorizontal: 14,
+    fontSize: 31,
+    fontWeight: '800',
+    letterSpacing: 0.4,
     marginBottom: 24,
-  },
-  collectionLinkText: {
-    color: '#BAE6FD',
-    fontSize: 13,
-    fontWeight: '700',
   },
   captureSection: {
     width: '100%',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 28,
+    marginBottom: 24,
   },
   listenHalo: {
     position: 'absolute',
@@ -459,195 +555,267 @@ const styles = StyleSheet.create({
     height: 260,
     borderRadius: 130,
     backgroundColor: '#38BDF8',
-    opacity: 0.35,
   },
   listenButton: {
-    width: 220,
-    height: 220,
-    borderRadius: 110,
+    width: 226,
+    height: 226,
+    borderRadius: 113,
     backgroundColor: '#111827',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.08)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
-    gap: 10,
+    gap: 12,
+    shadowColor: '#38BDF8',
+    shadowOpacity: 0.12,
+    shadowRadius: 28,
+    shadowOffset: { width: 0, height: 14 },
+    elevation: 5,
   },
   listenButtonActive: {
     backgroundColor: '#1E293B',
     borderColor: '#38BDF8',
   },
-  statusEyebrow: {
-    color: '#38BDF8',
-    fontSize: 11,
-    textTransform: 'uppercase',
-    letterSpacing: 1.4,
-  },
-  listenIconRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  listenBadge: {
-    color: '#E5E7EB',
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-    fontSize: 12,
-  },
   listenTitle: {
     color: '#F8FAFC',
-    fontSize: 24,
-    fontWeight: '700',
-  },
-  listenHint: {
-    color: '#A0AEC0',
-    fontSize: 13,
-    textAlign: 'center',
+    fontSize: 20,
+    fontWeight: '800',
   },
   durationText: {
-    color: '#F8FAFC',
-    fontSize: 28,
+    color: '#94A3B8',
+    fontSize: 17,
     fontVariant: ['tabular-nums'],
     fontWeight: '700',
     letterSpacing: 1,
   },
-  ctaPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#38BDF8',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 999,
-  },
-  ctaText: {
-    color: '#0F172A',
-    fontWeight: '700',
-    fontSize: 13,
-    letterSpacing: 0.6,
-    textTransform: 'uppercase',
-  },
-  panelLabel: {
-    color: '#E2E8F0',
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 8,
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-  },
-  actionsRow: {
-    width: '100%',
-    maxWidth: 360,
-    flexDirection: 'row',
-    gap: 12,
-    marginBottom: 18,
-  },
-  secondaryButton: {
-    flex: 1,
-    minHeight: 52,
-    borderRadius: 18,
-    backgroundColor: '#0EA5E9',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'row',
-    gap: 8,
-    paddingHorizontal: 16,
-  },
-  secondaryButtonText: {
-    color: '#F8FAFC',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  ghostButton: {
-    minHeight: 52,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: '#111827',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'row',
-    gap: 8,
-    paddingHorizontal: 16,
-  },
-  ghostButtonText: {
-    color: '#CBD5E1',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  buttonDisabled: {
-    opacity: 0.45,
-  },
-  metaRow: {
-    width: '100%',
-    maxWidth: 360,
-    flexDirection: 'row',
-    gap: 12,
-    marginBottom: 18,
-  },
-  metaPill: {
-    flex: 1,
-    borderRadius: 18,
-    backgroundColor: '#0B1220',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.06)',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
-  metaLabel: {
-    color: '#64748B',
-    fontSize: 11,
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-    marginBottom: 4,
-  },
-  metaValue: {
-    color: '#E2E8F0',
-    fontSize: 14,
-    fontWeight: '600',
-  },
   messageBoxError: {
     width: '100%',
-    maxWidth: 360,
-    borderRadius: 18,
-    backgroundColor: 'rgba(127, 29, 29, 0.35)',
+    maxWidth: 380,
+    borderRadius: 16,
+    backgroundColor: 'rgba(127, 29, 29, 0.34)',
     borderWidth: 1,
-    borderColor: 'rgba(248, 113, 113, 0.4)',
-    padding: 14,
-    marginBottom: 18,
-  },
-  messageTitle: {
-    color: '#FECACA',
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 4,
+    borderColor: 'rgba(248, 113, 113, 0.38)',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
   },
   messageBody: {
+    flex: 1,
     color: '#FEE2E2',
     fontSize: 14,
     lineHeight: 20,
   },
-  responseSection: {
+  recentSection: {
     width: '100%',
-    maxWidth: 360,
-    flex: 1,
-    minHeight: 180,
-    paddingBottom: 24,
+    maxWidth: 390,
+    height: 156,
+    marginTop: 'auto',
   },
-  responseBox: {
-    flex: 1,
-    borderRadius: 20,
-    backgroundColor: '#0B1120',
+  recentHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  recentTitle: {
+    color: '#E2E8F0',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  recentList: {
+    height: 110,
+  },
+  recentListContent: {
+    gap: 10,
+    paddingRight: 8,
+  },
+  emptyState: {
+    width: 330,
+    height: 100,
+    borderRadius: 18,
+    backgroundColor: '#0B1220',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.06)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
   },
-  responseBody: {
-    padding: 16,
-  },
-  responseText: {
-    color: '#D8E1F2',
+  emptyText: {
+    color: '#64748B',
     fontSize: 14,
-    lineHeight: 21,
-    fontFamily: 'monospace',
+    fontWeight: '600',
+  },
+  predictionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    width: 330,
+    height: 96,
+    gap: 12,
+    borderRadius: 20,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    paddingHorizontal: 14,
+  },
+  predictionIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(56, 189, 248, 0.12)',
+  },
+  predictionTextBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  predictionVehicle: {
+    color: '#F8FAFC',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  predictionRaw: {
+    color: '#64748B',
+    fontSize: 12,
+    marginTop: 3,
+  },
+  predictionTime: {
+    color: '#64748B',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  modalScreen: {
+    flex: 1,
+    backgroundColor: '#05060A',
+  },
+  modalCloseButton: {
+    position: 'absolute',
+    left: 18,
+    zIndex: 2,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.10)',
+  },
+  modalContent: {
+    alignItems: 'center',
+    paddingHorizontal: 28,
+  },
+  modalIcon: {
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(56, 189, 248, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.26)',
+    marginBottom: 26,
+  },
+  modalLabel: {
+    color: '#64748B',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+    marginBottom: 10,
+  },
+  modalVehicle: {
+    color: '#F8FAFC',
+    fontSize: 54,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  modalConfidence: {
+    color: '#BAE6FD',
+    fontSize: 18,
+    fontWeight: '800',
+    marginTop: 12,
+  },
+  modalTime: {
+    color: '#64748B',
+    fontSize: 14,
+    fontWeight: '700',
+    marginTop: 20,
+  },
+  detailSection: {
+    width: '100%',
+    marginTop: 34,
+  },
+  detailTitle: {
+    color: '#E2E8F0',
+    fontSize: 16,
+    fontWeight: '800',
+    marginBottom: 12,
+  },
+  waveformCard: {
+    minHeight: 128,
+    borderRadius: 22,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.18)',
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 3,
+  },
+  waveformBar: {
+    flex: 1,
+    maxWidth: 5,
+    borderRadius: 999,
+    backgroundColor: '#38BDF8',
+    opacity: 0.86,
+  },
+  scoreCard: {
+    borderRadius: 22,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    padding: 14,
+    gap: 14,
+  },
+  scoreRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  scoreLabel: {
+    width: 54,
+    color: '#F8FAFC',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  scoreTrack: {
+    flex: 1,
+    height: 9,
+    borderRadius: 999,
+    overflow: 'hidden',
+    backgroundColor: '#111827',
+  },
+  scoreFill: {
+    height: '100%',
+    borderRadius: 999,
+    backgroundColor: '#38BDF8',
+  },
+  scoreValue: {
+    width: 42,
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '800',
+    textAlign: 'right',
+  },
+  scoreEmpty: {
+    color: '#64748B',
+    fontSize: 14,
+    fontWeight: '600',
   },
 });
