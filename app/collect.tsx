@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Keyboard,
@@ -184,6 +184,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const scrollViewRef = useRef<ScrollView>(null);
   const cameraRef = useRef<CameraView>(null);
   const locationInputY = useRef(0);
+  const hasAutoRequestedMediaPermissions = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [microphonePermission, requestMicrophonePermission] = useMicrophonePermissions();
   const generateUploadUrl = useMutation(api.dataset.generateUploadUrl);
@@ -196,12 +197,56 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const [isRecording, setIsRecording] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isRequestingMediaPermissions, setIsRequestingMediaPermissions] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   const hasCameraAccess = cameraPermission?.granted ?? false;
   const hasMicrophoneAccess = microphonePermission?.granted ?? false;
+  const mediaPermissionsLoaded = cameraPermission !== null && microphonePermission !== null;
+  const hasMediaAccess = hasCameraAccess && hasMicrophoneAccess;
+  const trimmedLocationName = locationName.trim();
+  const canStartSession = Boolean(trimmedLocationName) && hasMediaAccess && !isUploading && !isStopping;
+
+  const requestMediaPermissions = useCallback(async () => {
+    if (isRequestingMediaPermissions) {
+      return;
+    }
+
+    try {
+      setIsRequestingMediaPermissions(true);
+      setErrorMessage(null);
+      const nextCamera = hasCameraAccess ? cameraPermission : await requestCameraPermission();
+      const nextMicrophone = hasMicrophoneAccess ? microphonePermission : await requestMicrophonePermission();
+
+      if (!nextCamera?.granted) {
+        setErrorMessage('Camera permission is required to record dataset sessions.');
+        return;
+      }
+
+      if (!nextMicrophone?.granted) {
+        setErrorMessage('Microphone permission is required to record dataset sessions.');
+      }
+    } finally {
+      setIsRequestingMediaPermissions(false);
+    }
+  }, [
+    cameraPermission,
+    hasCameraAccess,
+    hasMicrophoneAccess,
+    isRequestingMediaPermissions,
+    microphonePermission,
+    requestCameraPermission,
+    requestMicrophonePermission,
+  ]);
+
+  useEffect(() => {
+    if (mediaPermissionsLoaded && !hasMediaAccess && !hasAutoRequestedMediaPermissions.current) {
+      hasAutoRequestedMediaPermissions.current = true;
+      void requestMediaPermissions();
+    }
+  }, [mediaPermissionsLoaded, hasMediaAccess, requestMediaPermissions]);
 
   const ensurePermissions = async () => {
     const nextCamera = hasCameraAccess ? cameraPermission : await requestCameraPermission();
@@ -225,6 +270,12 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
 
   const startSession = async () => {
     if (isRecording || isUploading) {
+      return;
+    }
+
+    if (!trimmedLocationName) {
+      setErrorMessage('Enter a location name before starting a recording session.');
+      scrollToLocationInput();
       return;
     }
 
@@ -309,7 +360,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       return;
     }
 
-    const trimmedLocationName = locationName.trim();
     if (!trimmedLocationName) {
       setErrorMessage('Location name is required before uploading.');
       return;
@@ -431,16 +481,39 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         </View>
 
         <View style={styles.previewFrame}>
-          <CameraView
-            ref={cameraRef}
-            style={styles.camera}
-            facing="back"
-            mode="video"
-            videoQuality="480p"
-          />
+          {hasMediaAccess ? (
+            <CameraView
+              ref={cameraRef}
+              style={styles.camera}
+              facing="back"
+              mode="video"
+              videoQuality="480p"
+            />
+          ) : (
+            <View style={styles.cameraPlaceholder}>
+              <Ionicons name="camera-outline" size={34} color="#38BDF8" />
+              <Text style={styles.cameraPlaceholderTitle}>Camera permission needed</Text>
+              <Text style={styles.cameraPlaceholderBody}>Enable camera and microphone access to preview and record.</Text>
+              <TouchableOpacity
+                activeOpacity={0.85}
+                disabled={isRequestingMediaPermissions}
+                onPress={requestMediaPermissions}
+                style={[styles.permissionButton, isRequestingMediaPermissions && styles.buttonDisabled]}
+              >
+                {isRequestingMediaPermissions ? (
+                  <ActivityIndicator size="small" color="#0F172A" />
+                ) : (
+                  <Ionicons name="shield-checkmark-outline" size={18} color="#0F172A" />
+                )}
+                <Text style={styles.permissionButtonText}>
+                  {isRequestingMediaPermissions ? 'Requesting...' : 'Enable camera'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
           <View style={styles.recordingBadge}>
             <View style={[styles.recordingDot, isRecording && styles.recordingDotActive]} />
-            <Text style={styles.recordingText}>{isRecording ? 'Recording' : 'Ready'}</Text>
+            <Text style={styles.recordingText}>{isRecording ? 'Recording' : hasMediaAccess ? 'Ready' : 'Permission needed'}</Text>
           </View>
         </View>
 
@@ -504,9 +577,13 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         <View style={styles.actionsRow}>
           <TouchableOpacity
             activeOpacity={0.85}
-            disabled={isUploading || isStopping}
+            disabled={isRecording ? isStopping : !canStartSession}
             onPress={isRecording ? stopSession : startSession}
-            style={[styles.primaryButton, isRecording && styles.stopButton, isUploading && styles.buttonDisabled]}
+            style={[
+              styles.primaryButton,
+              isRecording && styles.stopButton,
+              !isRecording && !canStartSession && styles.buttonDisabled,
+            ]}
           >
             {isStopping ? (
               <ActivityIndicator size="small" color="#FFFFFF" />
@@ -721,6 +798,43 @@ const styles = StyleSheet.create({
   },
   camera: {
     flex: 1,
+  },
+  cameraPlaceholder: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+    gap: 10,
+    backgroundColor: '#0B1220',
+  },
+  cameraPlaceholderTitle: {
+    color: '#F8FAFC',
+    fontSize: 17,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  cameraPlaceholderBody: {
+    color: '#94A3B8',
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    maxWidth: 260,
+  },
+  permissionButton: {
+    minHeight: 44,
+    borderRadius: 8,
+    backgroundColor: '#38BDF8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginTop: 8,
+  },
+  permissionButtonText: {
+    color: '#0F172A',
+    fontSize: 13,
+    fontWeight: '800',
   },
   recordingBadge: {
     position: 'absolute',

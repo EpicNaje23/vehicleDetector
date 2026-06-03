@@ -1,6 +1,10 @@
 import { v } from 'convex/values';
 import { mutation, query } from './_generated/server';
 
+function roundCoordinate(value: number) {
+  return Math.round(value * 1000) / 1000;
+}
+
 export const generateUploadUrl = mutation({
   args: {},
   handler: async (ctx) => {
@@ -74,5 +78,28 @@ export const listRecentSessions = query({
       )
       .order('desc')
       .take(20);
+  },
+});
+
+export const listMapSessions = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return [];
+    }
+
+    const sessions = await ctx.db.query('sessions').withIndex('by_created_at').order('desc').take(250);
+
+    return sessions
+      .filter((session) => session.latitude !== undefined && session.longitude !== undefined)
+      .map((session) => ({
+        id: session._id,
+        latitude: roundCoordinate(session.latitude as number),
+        longitude: roundCoordinate(session.longitude as number),
+        locationName: session.locationName ?? 'Collection point',
+        createdAt: session.createdAt,
+        durationMillis: session.durationMillis,
+      }));
   },
 });

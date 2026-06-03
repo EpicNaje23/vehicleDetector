@@ -27,11 +27,32 @@ const DEFAULT_SERVER_URL = process.env.EXPO_PUBLIC_AUDIO_API_URL ?? '';
 type Prediction = {
   id: string;
   vehicle: string;
-  confidence?: string;
-  probabilities?: Record<string, number>;
-  waveformBars: number[];
+  confidence?: number;
+  scores?: PredictionScore[];
+  audio?: PredictionAudio;
+  waveform?: PredictionWaveform;
+  modelVersion?: string;
   createdAt: number;
   raw: string;
+};
+
+type PredictionScore = {
+  label: string;
+  confidence: number;
+};
+
+type PredictionAudio = {
+  durationSeconds: number;
+  sampleRate: number;
+  channels: number;
+};
+
+type PredictionWaveform = {
+  version: 1;
+  type: 'peak_pairs';
+  points: number;
+  min: number[];
+  max: number[];
 };
 
 function formatDuration(durationMillis: number) {
@@ -123,20 +144,130 @@ function getProbabilityMap(value: unknown) {
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
-function generateWaveformBars(seed: string, count = 42) {
-  let hash = 0;
+function normalizeConfidence(value: unknown) {
+  const confidence = Number(value);
+  return Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : undefined;
+}
 
-  for (let index = 0; index < seed.length; index += 1) {
-    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+function getNestedRecord(value: unknown, key: string) {
+  if (!value || typeof value !== 'object') {
+    return undefined;
   }
 
-  return Array.from({ length: count }, (_, index) => {
-    const wave = Math.sin((index / count) * Math.PI * 4) * 0.28;
-    hash = (hash * 1664525 + 1013904223) >>> 0;
-    const random = (hash % 1000) / 1000;
+  const nested = (value as Record<string, unknown>)[key];
+  return nested && typeof nested === 'object' ? nested as Record<string, unknown> : undefined;
+}
 
-    return Math.max(0.18, Math.min(1, 0.46 + wave + random * 0.38));
-  });
+function getPredictionLabel(value: unknown) {
+  const prediction = getNestedRecord(value, 'prediction');
+  const label = prediction?.label;
+
+  if (typeof label === 'string' && label.trim()) {
+    return label.trim();
+  }
+
+  return undefined;
+}
+
+function getPredictionConfidence(value: unknown) {
+  const prediction = getNestedRecord(value, 'prediction');
+  return normalizeConfidence(prediction?.confidence);
+}
+
+function getPredictionAudio(value: unknown): PredictionAudio | undefined {
+  const audio = getNestedRecord(value, 'audio');
+  if (!audio) {
+    return undefined;
+  }
+
+  const durationSeconds = Number(audio.durationSeconds);
+  const sampleRate = Number(audio.sampleRate);
+  const channels = Number(audio.channels);
+
+  if (!Number.isFinite(durationSeconds) || !Number.isFinite(sampleRate) || !Number.isFinite(channels)) {
+    return undefined;
+  }
+
+  return {
+    durationSeconds,
+    sampleRate,
+    channels,
+  };
+}
+
+function normalizeWaveformValue(value: unknown) {
+  const amplitude = Number(value);
+  return Number.isFinite(amplitude) ? Math.max(-1, Math.min(1, amplitude)) : undefined;
+}
+
+function getPredictionWaveform(value: unknown): PredictionWaveform | undefined {
+  const waveform = getNestedRecord(value, 'waveform');
+  if (!waveform || waveform.type !== 'peak_pairs' || waveform.version !== 1) {
+    return undefined;
+  }
+
+  if (!Array.isArray(waveform.min) || !Array.isArray(waveform.max)) {
+    return undefined;
+  }
+
+  const min = waveform.min.map(normalizeWaveformValue).filter((item) => item !== undefined);
+  const max = waveform.max.map(normalizeWaveformValue).filter((item) => item !== undefined);
+  const points = Math.min(min.length, max.length, Number(waveform.points) || min.length);
+
+  if (points <= 0) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    type: 'peak_pairs',
+    points,
+    min: min.slice(0, points),
+    max: max.slice(0, points),
+  };
+}
+
+function getPredictionScores(value: unknown): PredictionScore[] | undefined {
+  const responseScores = value && typeof value === 'object' ? (value as Record<string, unknown>).scores : undefined;
+
+  if (Array.isArray(responseScores)) {
+    const scores = responseScores
+      .map((score) => {
+        if (!score || typeof score !== 'object') {
+          return undefined;
+        }
+
+        const record = score as Record<string, unknown>;
+        const label = typeof record.label === 'string' ? record.label.trim() : '';
+        const confidence = normalizeConfidence(record.confidence);
+
+        return label && confidence !== undefined ? { label, confidence } : undefined;
+      })
+      .filter((score) => score !== undefined)
+      .sort((left, right) => right.confidence - left.confidence);
+
+    return scores.length > 0 ? scores : undefined;
+  }
+
+  const probabilities = getProbabilityMap(value);
+  if (!probabilities) {
+    return undefined;
+  }
+
+  return Object.entries(probabilities)
+    .map(([label, confidence]) => ({ label, confidence: normalizeConfidence(confidence) ?? 0 }))
+    .sort((left, right) => right.confidence - left.confidence);
+}
+
+function getModelVersion(value: unknown) {
+  const meta = getNestedRecord(value, 'meta');
+  const modelVersion = meta?.modelVersion;
+
+  return typeof modelVersion === 'string' && modelVersion.trim() ? modelVersion.trim() : undefined;
+}
+
+function formatConfidence(confidence: number) {
+  return `${Math.round(confidence * 100)}%`;
 }
 
 function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
@@ -152,7 +283,7 @@ function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
   }
 
   if (parsed && typeof parsed === 'object') {
-    const vehicle = findNestedValue(parsed, [
+    const legacyVehicle = findNestedValue(parsed, [
       'vehicle',
       'vehicleType',
       'vehicle_type',
@@ -164,7 +295,7 @@ function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
       'result',
       'name',
     ]);
-    const confidence = findNestedValue(parsed, [
+    const legacyConfidence = findNestedValue(parsed, [
       'confidence',
       'score',
       'probability',
@@ -173,10 +304,12 @@ function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
     ]);
 
     return {
-      vehicle: vehicle ? String(vehicle) : 'Prediction unavailable',
-      confidence: confidence ? String(confidence) : undefined,
-      probabilities: getProbabilityMap(parsed),
-      waveformBars: generateWaveformBars(raw),
+      vehicle: getPredictionLabel(parsed) ?? (legacyVehicle ? String(legacyVehicle) : 'Prediction unavailable'),
+      confidence: getPredictionConfidence(parsed) ?? normalizeConfidence(legacyConfidence),
+      scores: getPredictionScores(parsed),
+      audio: getPredictionAudio(parsed),
+      waveform: getPredictionWaveform(parsed),
+      modelVersion: getModelVersion(parsed),
       raw,
     };
   }
@@ -184,9 +317,44 @@ function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
   const cleaned = raw.trim();
   return {
     vehicle: cleaned || 'Prediction unavailable',
-    waveformBars: generateWaveformBars(cleaned || raw),
     raw: cleaned || raw,
   };
+}
+
+function WaveformEnvelope({ waveform }: { waveform?: PredictionWaveform }) {
+  if (!waveform) {
+    return (
+      <View style={[styles.waveformCard, styles.waveformEmptyCard]}>
+        <Ionicons name="pulse-outline" size={22} color="#64748B" />
+        <Text style={styles.waveformEmptyText}>No waveform returned.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.waveformCard}>
+      <View style={styles.waveformCenterLine} />
+      {waveform.min.map((minValue, index) => {
+        const maxValue = waveform.max[index] ?? 0;
+        const top = Math.max(0, (1 - Math.max(maxValue, 0)) * 50);
+        const bottom = Math.max(0, (1 - Math.abs(Math.min(minValue, 0))) * 50);
+
+        return (
+          <View key={`wave-${index}`} style={styles.waveformColumn}>
+            <View
+              style={[
+                styles.waveformPeak,
+                {
+                  top: `${top}%`,
+                  bottom: `${bottom}%`,
+                },
+              ]}
+            />
+          </View>
+        );
+      })}
+    </View>
+  );
 }
 
 export default function HomeScreen() {
@@ -436,7 +604,9 @@ export default function HomeScreen() {
                   </View>
                   <View style={styles.predictionTextBlock}>
                     <Text numberOfLines={1} style={styles.predictionVehicle}>{prediction.vehicle}</Text>
-                    <Text numberOfLines={1} style={styles.predictionRaw}>{prediction.confidence ? `Confidence ${prediction.confidence}` : prediction.raw}</Text>
+                    <Text numberOfLines={1} style={styles.predictionRaw}>
+                      {prediction.confidence !== undefined ? `Confidence ${formatConfidence(prediction.confidence)}` : prediction.raw}
+                    </Text>
                   </View>
                   <Text style={styles.predictionTime}>{new Date(prediction.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</Text>
                 </TouchableOpacity>
@@ -479,40 +649,41 @@ export default function HomeScreen() {
               <Text numberOfLines={2} adjustsFontSizeToFit style={styles.modalVehicle}>
                 {selectedPrediction.vehicle}
               </Text>
-              {selectedPrediction.confidence ? (
-                <Text style={styles.modalConfidence}>Confidence {selectedPrediction.confidence}</Text>
+              {selectedPrediction.confidence !== undefined ? (
+                <Text style={styles.modalConfidence}>Confidence {formatConfidence(selectedPrediction.confidence)}</Text>
               ) : null}
               <Text style={styles.modalTime}>
                 {new Date(selectedPrediction.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               </Text>
+              {selectedPrediction.modelVersion ? (
+                <Text style={styles.modalModel}>Model {selectedPrediction.modelVersion}</Text>
+              ) : null}
 
               <View style={styles.detailSection}>
                 <Text style={styles.detailTitle}>Waveform</Text>
-                <View style={styles.waveformCard}>
-                  {selectedPrediction.waveformBars.map((height, index) => (
-                    <View
-                      key={`${selectedPrediction.id}-wave-${index}`}
-                      style={[styles.waveformBar, { height: 18 + height * 66 }]}
-                    />
-                  ))}
-                </View>
+                <WaveformEnvelope waveform={selectedPrediction.waveform} />
+                {selectedPrediction.audio ? (
+                  <Text style={styles.audioMeta}>
+                    {selectedPrediction.audio.durationSeconds.toFixed(2)}s · {selectedPrediction.audio.sampleRate} Hz · {selectedPrediction.audio.channels} channel
+                    {selectedPrediction.audio.channels === 1 ? '' : 's'}
+                  </Text>
+                ) : null}
               </View>
 
               <View style={styles.detailSection}>
                 <Text style={styles.detailTitle}>Class scores</Text>
                 <View style={styles.scoreCard}>
-                  {Object.entries(selectedPrediction.probabilities ?? {})
-                    .sort(([, left], [, right]) => right - left)
-                    .map(([label, score]) => (
+                  {selectedPrediction.scores
+                    ?.map(({ label, confidence }) => (
                       <View key={label} style={styles.scoreRow}>
                         <Text style={styles.scoreLabel}>{label}</Text>
                         <View style={styles.scoreTrack}>
-                          <View style={[styles.scoreFill, { width: `${Math.round(score * 100)}%` }]} />
+                          <View style={[styles.scoreFill, { width: `${Math.round(confidence * 100)}%` }]} />
                         </View>
-                        <Text style={styles.scoreValue}>{Math.round(score * 100)}%</Text>
+                        <Text style={styles.scoreValue}>{Math.round(confidence * 100)}%</Text>
                       </View>
                     ))}
-                  {!selectedPrediction.probabilities ? (
+                  {!selectedPrediction.scores ? (
                     <Text style={styles.scoreEmpty}>No class scores returned.</Text>
                   ) : null}
                 </View>
@@ -746,6 +917,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: 20,
   },
+  modalModel: {
+    color: '#475569',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 8,
+  },
   detailSection: {
     width: '100%',
     marginTop: 34,
@@ -763,17 +940,47 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(56, 189, 248, 0.18)',
     paddingHorizontal: 14,
+    paddingVertical: 16,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 3,
+    overflow: 'hidden',
   },
-  waveformBar: {
+  waveformEmptyCard: {
+    justifyContent: 'center',
+    gap: 8,
+  },
+  waveformEmptyText: {
+    color: '#64748B',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  waveformCenterLine: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    top: '50%',
+    height: 1,
+    backgroundColor: 'rgba(148, 163, 184, 0.18)',
+  },
+  waveformColumn: {
     flex: 1,
-    maxWidth: 5,
+    height: 96,
+    justifyContent: 'center',
+  },
+  waveformPeak: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
     borderRadius: 999,
     backgroundColor: '#38BDF8',
-    opacity: 0.86,
+    opacity: 0.72,
+  },
+  audioMeta: {
+    color: '#64748B',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 10,
+    textAlign: 'center',
   },
   scoreCard: {
     borderRadius: 22,

@@ -14,7 +14,6 @@ export default defineSchema({
     longitude: v.optional(v.number()),
     locationAccuracy: v.optional(v.number()),
     locationName: v.optional(v.string()),
-    notes: v.optional(v.string()),
     device: v.string(),
     contributorId: v.optional(v.string()),
     contributorClerkUserId: v.optional(v.string()),
