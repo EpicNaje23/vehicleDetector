@@ -1,8 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useState } from 'react';
 import {
   ActivityIndicator,
-  Animated,
-  Easing,
   Modal,
   ScrollView,
   StyleSheet,
@@ -13,13 +11,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
-import {
-  RecordingPresets,
-  requestRecordingPermissionsAsync,
-  setAudioModeAsync,
-  useAudioRecorder,
-  useAudioRecorderState,
-} from 'expo-audio';
+import * as DocumentPicker from 'expo-document-picker';
 import { BottomNav, BOTTOM_NAV_HEIGHT } from '@/components/BottomNav';
 
 const DEFAULT_SERVER_URL = process.env.EXPO_PUBLIC_AUDIO_API_URL ?? '';
@@ -55,17 +47,11 @@ type PredictionWaveform = {
   max: number[];
 };
 
-function formatDuration(durationMillis: number) {
-  const totalSeconds = Math.max(0, Math.floor(durationMillis / 1000));
-  const minutes = Math.floor(totalSeconds / 60)
-    .toString()
-    .padStart(2, '0');
-  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+function getFileName(uri: string, fallbackName?: string | null) {
+  if (fallbackName?.trim()) {
+    return fallbackName.trim();
+  }
 
-  return `${minutes}:${seconds}`;
-}
-
-function getFileName(uri: string) {
   const fromUri = uri.split('/').pop();
 
   if (fromUri && fromUri.includes('.')) {
@@ -76,15 +62,17 @@ function getFileName(uri: string) {
 }
 
 function getMimeType(fileName: string) {
-  if (fileName.endsWith('.webm')) {
+  const normalizedFileName = fileName.toLowerCase();
+
+  if (normalizedFileName.endsWith('.webm')) {
     return 'audio/webm';
   }
 
-  if (fileName.endsWith('.wav')) {
+  if (normalizedFileName.endsWith('.wav')) {
     return 'audio/wav';
   }
 
-  if (fileName.endsWith('.mp3')) {
+  if (normalizedFileName.endsWith('.mp3')) {
     return 'audio/mpeg';
   }
 
@@ -358,84 +346,26 @@ function WaveformEnvelope({ waveform }: { waveform?: PredictionWaveform }) {
 }
 
 export default function HomeScreen() {
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
-  const recorderState = useAudioRecorderState(recorder, 200);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isPreparing, setIsPreparing] = useState(false);
   const [recentPredictions, setRecentPredictions] = useState<Prediction[]>([]);
   const [selectedPrediction, setSelectedPrediction] = useState<Prediction | null>(null);
-  const pulse = useRef(new Animated.Value(0)).current;
   const insets = useSafeAreaInsets();
-  const isRecording = recorderState.isRecording;
 
-  useEffect(() => {
-    let loop: Animated.CompositeAnimation | null = null;
-
-    if (isRecording) {
-      pulse.setValue(0);
-      loop = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulse, {
-            toValue: 1,
-            duration: 1400,
-            easing: Easing.out(Easing.quad),
-            useNativeDriver: true,
-          }),
-          Animated.timing(pulse, {
-            toValue: 0,
-            duration: 1400,
-            easing: Easing.in(Easing.quad),
-            useNativeDriver: true,
-          }),
-        ])
-      );
-      loop.start();
-    } else {
-      pulse.setValue(0);
-    }
-
-    return () => {
-      loop?.stop();
-    };
-  }, [isRecording, pulse]);
-
-  const statusText = useMemo(() => {
-    if (isRecording) {
-      return 'Listening…';
-    }
-
-    if (isPreparing) {
-      return 'Preparing…';
-    }
-
-    if (isSubmitting) {
-      return 'Predicting…';
-    }
-
-    return 'Tap to listen';
-  }, [isPreparing, isRecording, isSubmitting]);
-
-  const ensureMicrophonePermission = async () => {
-    const permission = await requestRecordingPermissionsAsync();
-    return permission.granted;
-  };
-
-  const uploadRecording = async (recordingUri: string, durationMillis: number) => {
+  const uploadAudioFile = async (audioUri: string, fileName?: string | null, mimeType?: string | null) => {
     if (!DEFAULT_SERVER_URL.trim()) {
       throw new Error('Missing EXPO_PUBLIC_AUDIO_API_URL for predictions.');
     }
 
-    const fileName = getFileName(recordingUri);
+    const resolvedFileName = getFileName(audioUri, fileName);
     const formData = new FormData();
 
     formData.append('file', {
-      uri: recordingUri,
-      name: fileName,
-      type: getMimeType(fileName),
+      uri: audioUri,
+      name: resolvedFileName,
+      type: mimeType ?? getMimeType(resolvedFileName),
     } as unknown as Blob);
     formData.append('source', 'mobile-app');
-    formData.append('durationMillis', String(durationMillis));
 
     const response = await fetch(DEFAULT_SERVER_URL.trim(), {
       method: 'POST',
@@ -463,68 +393,32 @@ export default function HomeScreen() {
     setSelectedPrediction(nextPrediction);
   };
 
-  const startRecording = async () => {
-    try {
-      setErrorMessage(null);
-      setIsPreparing(true);
-
-      const granted = await ensureMicrophonePermission();
-      if (!granted) {
-        setErrorMessage('Microphone permission is required to predict a vehicle.');
-        return;
-      }
-
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
-      });
-      await recorder.prepareToRecordAsync();
-      recorder.record();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to start recording.';
-      setErrorMessage(message);
-    } finally {
-      setIsPreparing(false);
+  const pickAndPredict = async () => {
+    if (isSubmitting) {
+      return;
     }
-  };
 
-  const stopAndPredict = async () => {
     try {
       setErrorMessage(null);
-      setIsPreparing(true);
+      const result = await DocumentPicker.getDocumentAsync({
+        type: 'audio/*',
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
 
-      await recorder.stop();
-      await setAudioModeAsync({ allowsRecording: false });
-
-      const recordingUri = recorder.uri ?? recorderState.url;
-      if (!recordingUri) {
-        setErrorMessage('Recording finished, but no audio file was created.');
+      if (result.canceled) {
         return;
       }
 
-      setIsPreparing(false);
       setIsSubmitting(true);
-      await uploadRecording(recordingUri, recorderState.durationMillis);
+      const [asset] = result.assets;
+      await uploadAudioFile(asset.uri, asset.name, asset.mimeType);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to predict vehicle.';
       setErrorMessage(message);
     } finally {
-      setIsPreparing(false);
       setIsSubmitting(false);
     }
-  };
-
-  const toggleRecording = async () => {
-    if (isPreparing || isSubmitting) {
-      return;
-    }
-
-    if (isRecording) {
-      await stopAndPredict();
-      return;
-    }
-
-    await startRecording();
   };
 
   return (
@@ -534,37 +428,19 @@ export default function HomeScreen() {
         <Text style={styles.heading}>CarZam</Text>
 
         <View style={styles.captureSection}>
-          <Animated.View
-            style={[
-              styles.listenHalo,
-              {
-                transform: [
-                  {
-                    scale: pulse.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [1, 1.5],
-                    }),
-                  },
-                ],
-                opacity: pulse.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0.34, 0],
-                }),
-              },
-            ]}
-          />
           <TouchableOpacity
             activeOpacity={0.86}
-            style={[styles.listenButton, isRecording && styles.listenButtonActive]}
-            onPress={toggleRecording}
+            disabled={isSubmitting}
+            style={[styles.listenButton, isSubmitting && styles.listenButtonDisabled]}
+            onPress={pickAndPredict}
           >
-            {isPreparing || isSubmitting ? (
+            {isSubmitting ? (
               <ActivityIndicator size="large" color="#FFFFFF" />
             ) : (
-              <Ionicons name={isRecording ? 'stop' : 'mic-outline'} size={42} color="#FFFFFF" />
+              <Ionicons name="cloud-upload-outline" size={44} color="#FFFFFF" />
             )}
-            <Text style={styles.listenTitle}>{statusText}</Text>
-            <Text style={styles.durationText}>{isRecording ? formatDuration(recorderState.durationMillis) : '00:00'}</Text>
+            <Text style={styles.listenTitle}>{isSubmitting ? 'Predicting…' : 'Upload audio'}</Text>
+            <Text style={styles.durationText}>WAV, MP3, M4A</Text>
           </TouchableOpacity>
         </View>
 
@@ -720,13 +596,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 24,
   },
-  listenHalo: {
-    position: 'absolute',
-    width: 260,
-    height: 260,
-    borderRadius: 130,
-    backgroundColor: '#38BDF8',
-  },
   listenButton: {
     width: 226,
     height: 226,
@@ -744,9 +613,10 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 14 },
     elevation: 5,
   },
-  listenButtonActive: {
+  listenButtonDisabled: {
     backgroundColor: '#1E293B',
     borderColor: '#38BDF8',
+    opacity: 0.78,
   },
   listenTitle: {
     color: '#F8FAFC',

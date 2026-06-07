@@ -19,6 +19,7 @@ import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo
 import * as Device from 'expo-device';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Location from 'expo-location';
+import * as SecureStore from 'expo-secure-store';
 import { useConvexAuth, useMutation, useQuery } from 'convex/react';
 
 import { BottomNav, BOTTOM_NAV_HEIGHT } from '@/components/BottomNav';
@@ -28,6 +29,7 @@ import type { Id } from '@/convex/_generated/dataModel';
 const CONVEX_URL = process.env.EXPO_PUBLIC_CONVEX_URL;
 const CLERK_PUBLISHABLE_KEY = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY;
 const MAX_SESSION_SECONDS = 30 * 60;
+const COLLECTION_CONSENT_KEY = 'carzam_collection_consent_v1';
 const CONVEX_AUTH_SETUP_MESSAGE =
   'Convex is not receiving your Clerk sign-in token. In Clerk, create or update the JWT template named "convex" with audience "convex", then sign out and sign back in.';
 
@@ -198,6 +200,8 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const [isStopping, setIsStopping] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isRequestingMediaPermissions, setIsRequestingMediaPermissions] = useState(false);
+  const [hasAcceptedCollectionConsent, setHasAcceptedCollectionConsent] = useState(false);
+  const [isConsentLoaded, setIsConsentLoaded] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -207,7 +211,37 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const mediaPermissionsLoaded = cameraPermission !== null && microphonePermission !== null;
   const hasMediaAccess = hasCameraAccess && hasMicrophoneAccess;
   const trimmedLocationName = locationName.trim();
-  const canStartSession = Boolean(trimmedLocationName) && hasMediaAccess && !isUploading && !isStopping;
+  const canStartSession =
+    Boolean(trimmedLocationName) &&
+    hasMediaAccess &&
+    hasAcceptedCollectionConsent &&
+    !isUploading &&
+    !isStopping;
+
+  useEffect(() => {
+    let isMounted = true;
+
+    SecureStore.getItemAsync(COLLECTION_CONSENT_KEY)
+      .then((storedConsent) => {
+        if (isMounted) {
+          setHasAcceptedCollectionConsent(storedConsent === 'accepted');
+        }
+      })
+      .finally(() => {
+        if (isMounted) {
+          setIsConsentLoaded(true);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const acceptCollectionConsent = async () => {
+    setHasAcceptedCollectionConsent(true);
+    await SecureStore.setItemAsync(COLLECTION_CONSENT_KEY, 'accepted');
+  };
 
   const requestMediaPermissions = useCallback(async () => {
     if (isRequestingMediaPermissions) {
@@ -276,6 +310,11 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     if (!trimmedLocationName) {
       setErrorMessage('Enter a location name before starting a recording session.');
       scrollToLocationInput();
+      return;
+    }
+
+    if (!hasAcceptedCollectionConsent) {
+      setErrorMessage('Review and accept the data collection notice before recording.');
       return;
     }
 
@@ -515,6 +554,44 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
             <View style={[styles.recordingDot, isRecording && styles.recordingDotActive]} />
             <Text style={styles.recordingText}>{isRecording ? 'Recording' : hasMediaAccess ? 'Ready' : 'Permission needed'}</Text>
           </View>
+        </View>
+
+        <View style={styles.guidanceCard}>
+          <View style={styles.guidanceHeader}>
+            <View style={styles.guidanceIcon}>
+              <Ionicons name="shield-checkmark-outline" size={18} color="#38BDF8" />
+            </View>
+            <View style={styles.guidanceTextBlock}>
+              <Text style={styles.guidanceTitle}>Collection notice</Text>
+              <Text style={styles.guidanceBody}>
+                Uploads include video, audio, approximate location, device info, and your contributor account for research/data collection.
+              </Text>
+            </View>
+          </View>
+          <View style={styles.guidanceList}>
+            <Text style={styles.guidanceItem}>Record vehicles in public or safe outdoor areas.</Text>
+            <Text style={styles.guidanceItem}>Avoid filming faces, private spaces, and sensitive information.</Text>
+            <Text style={styles.guidanceItem}>Use a clear location name such as city, street, or station area.</Text>
+          </View>
+          <TouchableOpacity
+            activeOpacity={0.85}
+            disabled={!isConsentLoaded || hasAcceptedCollectionConsent}
+            onPress={acceptCollectionConsent}
+            style={[
+              styles.consentButton,
+              hasAcceptedCollectionConsent && styles.consentButtonAccepted,
+              !isConsentLoaded && styles.buttonDisabled,
+            ]}
+          >
+            <Ionicons
+              name={hasAcceptedCollectionConsent ? 'checkmark-circle' : 'ellipse-outline'}
+              size={18}
+              color={hasAcceptedCollectionConsent ? '#86EFAC' : '#0F172A'}
+            />
+            <Text style={[styles.consentButtonText, hasAcceptedCollectionConsent && styles.consentButtonTextAccepted]}>
+              {hasAcceptedCollectionConsent ? 'Collection notice accepted' : 'I understand and agree'}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         <View
@@ -861,6 +938,73 @@ const styles = StyleSheet.create({
     color: '#F8FAFC',
     fontSize: 13,
     fontWeight: '700',
+  },
+  guidanceCard: {
+    borderRadius: 8,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.2)',
+    padding: 14,
+    marginBottom: 14,
+    gap: 12,
+  },
+  guidanceHeader: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  guidanceIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(56, 189, 248, 0.12)',
+  },
+  guidanceTextBlock: {
+    flex: 1,
+    minWidth: 0,
+    gap: 4,
+  },
+  guidanceTitle: {
+    color: '#F8FAFC',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  guidanceBody: {
+    color: '#94A3B8',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  guidanceList: {
+    gap: 6,
+  },
+  guidanceItem: {
+    color: '#CBD5E1',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  consentButton: {
+    minHeight: 46,
+    borderRadius: 8,
+    backgroundColor: '#38BDF8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 14,
+  },
+  consentButtonAccepted: {
+    backgroundColor: 'rgba(34, 197, 94, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(134, 239, 172, 0.28)',
+  },
+  consentButtonText: {
+    color: '#0F172A',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  consentButtonTextAccepted: {
+    color: '#86EFAC',
   },
   formPanel: {
     gap: 10,

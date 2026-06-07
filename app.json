@@ -1,20 +1,22 @@
 {
   "expo": {
-    "name": "vehicleDetector",
-    "slug": "vehicleDetector",
+    "name": "CarZam",
+    "slug": "carzam",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "vehicledetector",
+    "scheme": "carzam",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
+      "bundleIdentifier": "com.jeandindane.carzam",
       "infoPlist": {
         "UIBackgroundModes": ["audio"]
       },
       "supportsTablet": true
     },
     "android": {
+      "package": "com.jeandindane.carzam",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
