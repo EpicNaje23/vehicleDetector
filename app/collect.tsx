@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Keyboard,
   ScrollView,
   StyleSheet,
@@ -30,6 +31,8 @@ const CONVEX_URL = process.env.EXPO_PUBLIC_CONVEX_URL;
 const CLERK_PUBLISHABLE_KEY = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY;
 const MAX_SESSION_SECONDS = 30 * 60;
 const COLLECTION_CONSENT_KEY = 'carzam_collection_consent_v1';
+const PENDING_SESSIONS_FOLDER = 'carzam-sessions';
+const PENDING_SESSIONS_MANIFEST = 'pending-sessions.json';
 const CONVEX_AUTH_SETUP_MESSAGE =
   'Convex is not receiving your Clerk sign-in token. In Clerk, create or update the JWT template named "convex" with audience "convex", then sign out and sign back in.';
 
@@ -47,6 +50,20 @@ type UploadProgress = {
   sentBytes: number;
   totalBytes: number;
   percent: number;
+};
+
+type PendingUploadStatus = 'pending' | 'uploading' | 'failed';
+
+type PendingSession = SessionDraft & {
+  videoUri: string;
+  fileName: string;
+  fileType: string;
+  locationName: string;
+  device: string;
+  fileSizeBytes?: number;
+  savedAt: string;
+  status: PendingUploadStatus;
+  lastError?: string;
 };
 
 type CollectScreenContentProps = {
@@ -81,8 +98,115 @@ function makeSessionId() {
   return `session-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 }
 
-function getVideoFileName(sessionId: string) {
-  return `${sessionId}.mov`;
+function getRecordingExtension(recordingUri: string) {
+  const uriWithoutQuery = recordingUri.split('?')[0];
+  const extension = uriWithoutQuery.match(/\.([a-zA-Z0-9]+)$/)?.[1]?.toLowerCase();
+
+  return extension === 'mp4' || extension === 'mov' ? extension : 'mov';
+}
+
+function getVideoFileName(sessionId: string, extension: 'mp4' | 'mov') {
+  return `${sessionId}.${extension}`;
+}
+
+function getVideoFileType(extension: 'mp4' | 'mov') {
+  return extension === 'mp4' ? 'video/mp4' : 'video/quicktime';
+}
+
+function getPendingSessionsDirectory() {
+  if (!FileSystem.documentDirectory) {
+    throw new Error('Local document storage is not available on this device.');
+  }
+
+  return `${FileSystem.documentDirectory}${PENDING_SESSIONS_FOLDER}/`;
+}
+
+function getPendingSessionsManifestUri() {
+  return `${getPendingSessionsDirectory()}${PENDING_SESSIONS_MANIFEST}`;
+}
+
+async function ensurePendingSessionsDirectory() {
+  const directory = getPendingSessionsDirectory();
+  const directoryInfo = await FileSystem.getInfoAsync(directory);
+
+  if (!directoryInfo.exists) {
+    await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+  }
+
+  return directory;
+}
+
+function isPendingUploadStatus(value: unknown): value is PendingUploadStatus {
+  return value === 'pending' || value === 'uploading' || value === 'failed';
+}
+
+function parsePendingSession(value: unknown): PendingSession | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.sessionId !== 'string' ||
+    typeof record.videoUri !== 'string' ||
+    typeof record.fileName !== 'string' ||
+    typeof record.fileType !== 'string' ||
+    typeof record.locationName !== 'string' ||
+    typeof record.device !== 'string' ||
+    typeof record.startedAt !== 'string' ||
+    typeof record.endedAt !== 'string' ||
+    typeof record.durationMillis !== 'number' ||
+    typeof record.savedAt !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    sessionId: record.sessionId,
+    videoUri: record.videoUri,
+    fileName: record.fileName,
+    fileType: record.fileType,
+    locationName: record.locationName,
+    device: record.device,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+    durationMillis: record.durationMillis,
+    savedAt: record.savedAt,
+    status: isPendingUploadStatus(record.status) && record.status !== 'uploading' ? record.status : 'pending',
+    latitude: typeof record.latitude === 'number' ? record.latitude : undefined,
+    longitude: typeof record.longitude === 'number' ? record.longitude : undefined,
+    locationAccuracy: typeof record.locationAccuracy === 'number' ? record.locationAccuracy : undefined,
+    fileSizeBytes: typeof record.fileSizeBytes === 'number' ? record.fileSizeBytes : undefined,
+    lastError: typeof record.lastError === 'string' ? record.lastError : undefined,
+  };
+}
+
+async function readPendingSessionsManifest() {
+  try {
+    await ensurePendingSessionsDirectory();
+    const manifestUri = getPendingSessionsManifestUri();
+    const manifestInfo = await FileSystem.getInfoAsync(manifestUri);
+
+    if (!manifestInfo.exists) {
+      return [];
+    }
+
+    const manifest = await FileSystem.readAsStringAsync(manifestUri);
+    const parsed = JSON.parse(manifest) as unknown;
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.map(parsePendingSession).filter((session): session is PendingSession => session !== null);
+  } catch {
+    return [];
+  }
+}
+
+async function writePendingSessionsManifest(sessions: PendingSession[]) {
+  await ensurePendingSessionsDirectory();
+  await FileSystem.writeAsStringAsync(getPendingSessionsManifestUri(), JSON.stringify(sessions, null, 2));
 }
 
 function getDeviceLabel() {
@@ -193,12 +317,16 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const createSession = useMutation(api.dataset.createSession);
   const recentSessions = useQuery(api.dataset.listRecentSessions, convexAuth.isAuthenticated ? {} : 'skip');
   const [locationName, setLocationName] = useState('');
-  const [videoUri, setVideoUri] = useState<string | null>(null);
   const [sessionDraft, setSessionDraft] = useState<SessionDraft | null>(null);
+  const pendingSessionsRef = useRef<PendingSession[]>([]);
+  const [pendingSessions, setPendingSessions] = useState<PendingSession[]>([]);
+  const [isPendingSessionsLoaded, setIsPendingSessionsLoaded] = useState(false);
   const [elapsedMillis, setElapsedMillis] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isUploadingAll, setIsUploadingAll] = useState(false);
+  const [activeUploadSessionId, setActiveUploadSessionId] = useState<string | null>(null);
   const [isRequestingMediaPermissions, setIsRequestingMediaPermissions] = useState(false);
   const [hasAcceptedCollectionConsent, setHasAcceptedCollectionConsent] = useState(false);
   const [isConsentLoaded, setIsConsentLoaded] = useState(false);
@@ -215,8 +343,102 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     Boolean(trimmedLocationName) &&
     hasMediaAccess &&
     hasAcceptedCollectionConsent &&
+    isPendingSessionsLoaded &&
     !isUploading &&
+    !isUploadingAll &&
     !isStopping;
+
+  const uploadablePendingSessions = pendingSessions.filter((session) => session.status !== 'uploading');
+
+  useEffect(() => {
+    pendingSessionsRef.current = pendingSessions;
+  }, [pendingSessions]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    readPendingSessionsManifest()
+      .then((storedSessions) => {
+        if (isMounted) {
+          setPendingSessions(storedSessions);
+        }
+      })
+      .catch((error) => {
+        if (isMounted) {
+          const message = error instanceof Error ? error.message : 'Unable to load saved recordings.';
+          setErrorMessage(message);
+        }
+      })
+      .finally(() => {
+        if (isMounted) {
+          setIsPendingSessionsLoaded(true);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const persistPendingSessions = useCallback(async (nextSessions: PendingSession[]) => {
+    await writePendingSessionsManifest(nextSessions);
+    pendingSessionsRef.current = nextSessions;
+    setPendingSessions(nextSessions);
+  }, []);
+
+  const updatePendingSession = useCallback(
+    async (sessionId: string, updates: Partial<PendingSession>) => {
+      const nextSessions = pendingSessionsRef.current.map((session) =>
+        session.sessionId === sessionId ? { ...session, ...updates } : session,
+      );
+      await persistPendingSessions(nextSessions);
+    },
+    [persistPendingSessions],
+  );
+
+  const deletePendingSession = useCallback(
+    async (pendingSession: PendingSession) => {
+      try {
+        setErrorMessage(null);
+        setSuccessMessage(null);
+
+        await FileSystem.deleteAsync(pendingSession.videoUri, { idempotent: true });
+        await persistPendingSessions(
+          pendingSessionsRef.current.filter((session) => session.sessionId !== pendingSession.sessionId),
+        );
+        setSuccessMessage('Pending recording deleted from this device.');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to delete pending recording.';
+        setErrorMessage(message);
+      }
+    },
+    [persistPendingSessions],
+  );
+
+  const confirmDeletePendingSession = useCallback(
+    (pendingSession: PendingSession) => {
+      if (activeUploadSessionId === pendingSession.sessionId) {
+        setErrorMessage('Wait for the current upload to finish before deleting this recording.');
+        return;
+      }
+
+      Alert.alert(
+        'Delete pending recording?',
+        'This removes the local video from this device. It cannot be uploaded later.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => {
+              void deletePendingSession(pendingSession);
+            },
+          },
+        ],
+      );
+    },
+    [activeUploadSessionId, deletePendingSession],
+  );
 
   useEffect(() => {
     let isMounted = true;
@@ -302,8 +524,66 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     return null;
   };
 
+  const saveRecordingToOutbox = useCallback(
+    async (recordingUri: string, draft: SessionDraft, savedLocationName: string) => {
+      const sourceInfo = await FileSystem.getInfoAsync(recordingUri);
+
+      if (!sourceInfo.exists) {
+        throw new Error('Recording stopped, but the local video file could not be found.');
+      }
+
+      const directory = await ensurePendingSessionsDirectory();
+      const extension = getRecordingExtension(recordingUri);
+      const fileName = getVideoFileName(draft.sessionId, extension);
+      const persistentUri = `${directory}${fileName}`;
+      const existingPersistentFile = await FileSystem.getInfoAsync(persistentUri);
+
+      if (existingPersistentFile.exists) {
+        await FileSystem.deleteAsync(persistentUri, { idempotent: true });
+      }
+
+      await FileSystem.copyAsync({
+        from: recordingUri,
+        to: persistentUri,
+      });
+
+      const persistedInfo = await FileSystem.getInfoAsync(persistentUri);
+      if (!persistedInfo.exists) {
+        throw new Error('Recording could not be saved to local app storage.');
+      }
+
+      const fileSizeBytes = 'size' in persistedInfo && typeof persistedInfo.size === 'number'
+        ? persistedInfo.size
+        : undefined;
+      const pendingSession: PendingSession = {
+        ...draft,
+        videoUri: persistentUri,
+        fileName,
+        fileType: getVideoFileType(extension),
+        locationName: savedLocationName,
+        device: getDeviceLabel(),
+        fileSizeBytes,
+        savedAt: new Date().toISOString(),
+        status: 'pending',
+      };
+      const nextSessions = [
+        pendingSession,
+        ...pendingSessionsRef.current.filter((session) => session.sessionId !== pendingSession.sessionId),
+      ];
+
+      await persistPendingSessions(nextSessions);
+
+      if (recordingUri !== persistentUri) {
+        await FileSystem.deleteAsync(recordingUri, { idempotent: true });
+      }
+
+      return pendingSession;
+    },
+    [persistPendingSessions],
+  );
+
   const startSession = async () => {
-    if (isRecording || isUploading) {
+    if (isRecording || isUploading || isUploadingAll) {
       return;
     }
 
@@ -318,11 +598,12 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       return;
     }
 
+    let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+
     try {
       setErrorMessage(null);
       setSuccessMessage(null);
       setUploadProgress(null);
-      setVideoUri(null);
       setSessionDraft(null);
       setElapsedMillis(0);
 
@@ -339,7 +620,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
 
       setIsRecording(true);
       setIsStopping(false);
-      const elapsedTimer = setInterval(() => {
+      elapsedTimer = setInterval(() => {
         setElapsedMillis(Date.now() - startedAtMs);
       }, 500);
 
@@ -348,15 +629,14 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       });
       const endedAtDate = new Date();
       clearInterval(elapsedTimer);
+      elapsedTimer = null;
 
       if (!recording?.uri) {
         setErrorMessage('Recording stopped, but no video file was created.');
         return;
       }
 
-      setVideoUri(recording.uri);
-      setElapsedMillis(endedAtDate.getTime() - startedAtMs);
-      setSessionDraft({
+      const draft = {
         sessionId,
         startedAt: startedAtDate.toISOString(),
         endedAt: endedAtDate.toISOString(),
@@ -364,12 +644,20 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
         locationAccuracy: location.coords.accuracy ?? undefined,
-      });
+      };
+
+      await saveRecordingToOutbox(recording.uri, draft, trimmedLocationName);
+      setElapsedMillis(draft.durationMillis);
+      setSessionDraft(draft);
       setSuccessMessage('Session saved locally. Upload it when the network is stable.');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to record dataset session.';
       setErrorMessage(message);
     } finally {
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+      }
+
       setIsRecording(false);
       setIsStopping(false);
     }
@@ -387,23 +675,13 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const scrollToLocationInput = () => {
     setTimeout(() => {
       scrollViewRef.current?.scrollTo({
-        y: Math.max(locationInputY.current - 80, 0),
+        y: Math.max(locationInputY.current - 120, 0),
         animated: true,
       });
-    }, 160);
+    }, 180);
   };
 
-  const uploadSession = async () => {
-    if (!videoUri || !sessionDraft) {
-      setErrorMessage('Record a session before uploading.');
-      return;
-    }
-
-    if (!trimmedLocationName) {
-      setErrorMessage('Location name is required before uploading.');
-      return;
-    }
-
+  const uploadPendingSession = useCallback(async (pendingSession: PendingSession) => {
     try {
       setErrorMessage(null);
       setSuccessMessage(null);
@@ -419,23 +697,29 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       }
 
       setIsUploading(true);
+      setActiveUploadSessionId(pendingSession.sessionId);
       setUploadProgress({ sentBytes: 0, totalBytes: 0, percent: 0 });
+      await updatePendingSession(pendingSession.sessionId, { status: 'uploading', lastError: undefined });
 
-      const fileType = 'video/quicktime';
-      const fileName = getVideoFileName(sessionDraft.sessionId);
-      const fileInfo = await FileSystem.getInfoAsync(videoUri);
-      const fileSizeBytes = fileInfo.exists ? fileInfo.size : undefined;
+      const fileInfo = await FileSystem.getInfoAsync(pendingSession.videoUri);
+      if (!fileInfo.exists) {
+        throw new Error('The local video file is missing. The recording may have been removed from this device.');
+      }
+
+      const fileSizeBytes = 'size' in fileInfo && typeof fileInfo.size === 'number'
+        ? fileInfo.size
+        : pendingSession.fileSizeBytes;
       setUploadProgress({
         sentBytes: 0,
         totalBytes: fileSizeBytes ?? 0,
         percent: 0,
       });
       const uploadUrl = await generateUploadUrl();
-      const uploadTask = FileSystem.createUploadTask(uploadUrl, videoUri, {
+      const uploadTask = FileSystem.createUploadTask(uploadUrl, pendingSession.videoUri, {
         httpMethod: 'POST',
         uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
         headers: {
-          'Content-Type': fileType,
+          'Content-Type': pendingSession.fileType,
         },
         sessionType: FileSystem.FileSystemSessionType.BACKGROUND,
       }, (progress) => {
@@ -453,38 +737,105 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       const uploadResponse = await uploadTask.uploadAsync();
 
       if (!uploadResponse) {
-        setErrorMessage('Convex storage upload did not return a response.');
-        return;
+        throw new Error('Convex storage upload did not return a response.');
       }
 
       if (uploadResponse.status < 200 || uploadResponse.status >= 300) {
-        setErrorMessage(`Convex storage upload failed with status ${uploadResponse.status}.`);
-        return;
+        throw new Error(`Convex storage upload failed with status ${uploadResponse.status}.`);
       }
 
       const { storageId } = JSON.parse(uploadResponse.body) as { storageId: string };
+      if (!storageId) {
+        throw new Error('Convex storage upload did not return a storage ID.');
+      }
 
       await createSession({
-        ...sessionDraft,
+        sessionId: pendingSession.sessionId,
+        startedAt: pendingSession.startedAt,
+        endedAt: pendingSession.endedAt,
+        durationMillis: pendingSession.durationMillis,
+        latitude: pendingSession.latitude,
+        longitude: pendingSession.longitude,
+        locationAccuracy: pendingSession.locationAccuracy,
         storageId: storageId as Id<'_storage'>,
-        fileName,
-        fileType,
-        locationName: trimmedLocationName,
-        device: getDeviceLabel(),
+        fileName: pendingSession.fileName,
+        fileType: pendingSession.fileType,
+        locationName: pendingSession.locationName,
+        device: pendingSession.device,
         fileSizeBytes,
         uploadedAt: Date.now(),
       });
 
       setUploadProgress({ sentBytes: fileSizeBytes ?? 0, totalBytes: fileSizeBytes ?? 0, percent: 100 });
+      await persistPendingSessions(
+        pendingSessionsRef.current.filter((session) => session.sessionId !== pendingSession.sessionId),
+      );
+
+      try {
+        await FileSystem.deleteAsync(pendingSession.videoUri, { idempotent: true });
+      } catch {
+        // Upload is already durable in Convex; local cleanup can fail without blocking the user.
+      }
+
       setSuccessMessage('Dataset session uploaded to Convex.');
-      setVideoUri(null);
-      setSessionDraft(null);
       setElapsedMillis(0);
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to upload dataset session.';
+      await updatePendingSession(pendingSession.sessionId, { status: 'failed', lastError: message });
       setErrorMessage(message);
+      return false;
     } finally {
       setIsUploading(false);
+      setActiveUploadSessionId(null);
+    }
+  }, [
+    convexAuth.isAuthenticated,
+    convexAuth.isLoading,
+    createSession,
+    generateUploadUrl,
+    persistPendingSessions,
+    updatePendingSession,
+  ]);
+
+  const uploadAllPendingSessions = async () => {
+    if (isUploading || isUploadingAll) {
+      return;
+    }
+
+    const sessionsToUpload = pendingSessionsRef.current.filter((session) => session.status !== 'uploading');
+    if (sessionsToUpload.length === 0) {
+      return;
+    }
+
+    setIsUploadingAll(true);
+    let uploadedCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (const pendingSession of sessionsToUpload) {
+        const wasUploaded = await uploadPendingSession(pendingSession);
+
+        if (wasUploaded) {
+          uploadedCount += 1;
+        } else {
+          failedCount += 1;
+        }
+      }
+
+      if (uploadedCount > 0) {
+        setSuccessMessage(`${uploadedCount} saved session${uploadedCount === 1 ? '' : 's'} uploaded to Convex.`);
+      }
+
+      if (failedCount > 0) {
+        const failedSession = pendingSessionsRef.current.find((session) => session.status === 'failed');
+        setErrorMessage(
+          failedSession?.lastError ??
+            `${failedCount} saved session${failedCount === 1 ? '' : 's'} could not be uploaded. Retry later.`,
+        );
+      }
+    } finally {
+      setIsUploadingAll(false);
     }
   };
 
@@ -496,7 +847,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
           ref={scrollViewRef}
           contentContainerStyle={[
             styles.screen,
-            { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 24 },
+            { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 140 },
           ]}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
@@ -556,43 +907,35 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
           </View>
         </View>
 
-        <View style={styles.guidanceCard}>
-          <View style={styles.guidanceHeader}>
-            <View style={styles.guidanceIcon}>
-              <Ionicons name="shield-checkmark-outline" size={18} color="#38BDF8" />
+        {!hasAcceptedCollectionConsent ? (
+          <View style={styles.guidanceCard}>
+            <View style={styles.guidanceHeader}>
+              <View style={styles.guidanceIcon}>
+                <Ionicons name="shield-checkmark-outline" size={18} color="#38BDF8" />
+              </View>
+              <View style={styles.guidanceTextBlock}>
+                <Text style={styles.guidanceTitle}>Collection notice</Text>
+                <Text style={styles.guidanceBody}>
+                  Uploads include video, audio, approximate location, device info, and your contributor account for research/data collection.
+                </Text>
+              </View>
             </View>
-            <View style={styles.guidanceTextBlock}>
-              <Text style={styles.guidanceTitle}>Collection notice</Text>
-              <Text style={styles.guidanceBody}>
-                Uploads include video, audio, approximate location, device info, and your contributor account for research/data collection.
-              </Text>
+            <View style={styles.guidanceList}>
+              <Text style={styles.guidanceItem}>Record vehicles in public or safe outdoor areas.</Text>
+              <Text style={styles.guidanceItem}>Avoid filming faces, private spaces, and sensitive information.</Text>
+              <Text style={styles.guidanceItem}>Use a clear location name such as city, street, or station area.</Text>
             </View>
+            <TouchableOpacity
+              activeOpacity={0.85}
+              disabled={!isConsentLoaded}
+              onPress={acceptCollectionConsent}
+              style={[styles.consentButton, !isConsentLoaded && styles.buttonDisabled]}
+            >
+              <Ionicons name="ellipse-outline" size={18} color="#0F172A" />
+              <Text style={styles.consentButtonText}>I understand and agree</Text>
+            </TouchableOpacity>
           </View>
-          <View style={styles.guidanceList}>
-            <Text style={styles.guidanceItem}>Record vehicles in public or safe outdoor areas.</Text>
-            <Text style={styles.guidanceItem}>Avoid filming faces, private spaces, and sensitive information.</Text>
-            <Text style={styles.guidanceItem}>Use a clear location name such as city, street, or station area.</Text>
-          </View>
-          <TouchableOpacity
-            activeOpacity={0.85}
-            disabled={!isConsentLoaded || hasAcceptedCollectionConsent}
-            onPress={acceptCollectionConsent}
-            style={[
-              styles.consentButton,
-              hasAcceptedCollectionConsent && styles.consentButtonAccepted,
-              !isConsentLoaded && styles.buttonDisabled,
-            ]}
-          >
-            <Ionicons
-              name={hasAcceptedCollectionConsent ? 'checkmark-circle' : 'ellipse-outline'}
-              size={18}
-              color={hasAcceptedCollectionConsent ? '#86EFAC' : '#0F172A'}
-            />
-            <Text style={[styles.consentButtonText, hasAcceptedCollectionConsent && styles.consentButtonTextAccepted]}>
-              {hasAcceptedCollectionConsent ? 'Collection notice accepted' : 'I understand and agree'}
-            </Text>
-          </TouchableOpacity>
-        </View>
+        ) : null}
 
         <View
           style={styles.formPanel}
@@ -671,22 +1014,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
               {isStopping ? 'Stopping...' : isRecording ? 'Stop session' : 'Start session'}
             </Text>
           </TouchableOpacity>
-
-          <TouchableOpacity
-            activeOpacity={0.85}
-            disabled={!videoUri || isRecording || isUploading}
-            onPress={uploadSession}
-            style={[styles.secondaryButton, (!videoUri || isRecording || isUploading) && styles.buttonDisabled]}
-          >
-            {isUploading ? (
-              <ActivityIndicator size="small" color="#0F172A" />
-            ) : (
-              <Ionicons name="cloud-upload-outline" size={18} color="#0F172A" />
-            )}
-            <Text style={styles.secondaryButtonText}>
-              {isUploading ? `${uploadProgress?.percent ?? 0}%` : 'Upload'}
-            </Text>
-          </TouchableOpacity>
         </View>
 
         {errorMessage ? (
@@ -702,6 +1029,107 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
             <Text style={styles.messageBody}>{successMessage}</Text>
           </View>
         ) : null}
+
+        <View style={styles.sessionsPanel}>
+          <View style={styles.panelHeaderRow}>
+            <Text style={[styles.panelLabel, styles.panelLabelInHeader]}>Pending uploads</Text>
+            {uploadablePendingSessions.length > 0 ? (
+              <TouchableOpacity
+                activeOpacity={0.85}
+                disabled={isUploading || isUploadingAll || isRecording}
+                onPress={uploadAllPendingSessions}
+                style={[
+                  styles.uploadAllButton,
+                  (isUploading || isUploadingAll || isRecording) && styles.buttonDisabled,
+                ]}
+              >
+                {isUploadingAll ? (
+                  <ActivityIndicator size="small" color="#0F172A" />
+                ) : (
+                  <Ionicons name="cloud-upload-outline" size={15} color="#0F172A" />
+                )}
+                <Text style={styles.uploadAllButtonText}>
+                  {isUploadingAll ? 'Uploading...' : `Upload all (${uploadablePendingSessions.length})`}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+          {!isPendingSessionsLoaded ? (
+            <ActivityIndicator size="small" color="#38BDF8" />
+          ) : pendingSessions.length === 0 ? (
+            <Text style={styles.emptyText}>Completed recordings waiting for upload will appear here.</Text>
+          ) : (
+            pendingSessions.map((pendingSession) => {
+              const isSessionUploading = activeUploadSessionId === pendingSession.sessionId;
+              const statusLabel = isSessionUploading
+                ? 'uploading'
+                : pendingSession.status === 'failed'
+                  ? 'failed'
+                  : 'pending';
+
+              return (
+                <View key={pendingSession.sessionId} style={styles.pendingSessionRow}>
+                  <View style={styles.sessionInfo}>
+                    <View style={styles.pendingSessionTitleRow}>
+                      <Text numberOfLines={1} style={styles.sessionTitle}>{pendingSession.locationName}</Text>
+                      <Text style={[
+                        styles.pendingStatus,
+                        statusLabel === 'failed' && styles.pendingStatusFailed,
+                        statusLabel === 'uploading' && styles.pendingStatusUploading,
+                      ]}>
+                        {statusLabel}
+                      </Text>
+                    </View>
+                    <Text style={styles.sessionMeta}>
+                      {formatDuration(pendingSession.durationMillis)}
+                      {pendingSession.fileSizeBytes ? ` · ${formatBytes(pendingSession.fileSizeBytes)}` : ''}
+                      {' · saved locally'}
+                    </Text>
+                    {pendingSession.lastError ? (
+                      <Text numberOfLines={2} style={styles.pendingError}>{pendingSession.lastError}</Text>
+                    ) : null}
+                  </View>
+                  <View style={styles.pendingActions}>
+                    <TouchableOpacity
+                      activeOpacity={0.85}
+                      disabled={isUploading || isUploadingAll || isRecording}
+                      onPress={() => {
+                        void uploadPendingSession(pendingSession);
+                      }}
+                      style={[
+                        styles.pendingUploadButton,
+                        (isUploading || isUploadingAll || isRecording) && styles.buttonDisabled,
+                      ]}
+                    >
+                      {isSessionUploading ? (
+                        <ActivityIndicator size="small" color="#0F172A" />
+                      ) : (
+                        <Ionicons name="cloud-upload-outline" size={16} color="#0F172A" />
+                      )}
+                      <Text style={styles.pendingUploadButtonText}>
+                        {isSessionUploading ? `${uploadProgress?.percent ?? 0}%` : 'Upload'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      accessibilityLabel="Delete pending recording"
+                      activeOpacity={0.85}
+                      disabled={isUploading || isUploadingAll || isRecording}
+                      onPress={() => {
+                        confirmDeletePendingSession(pendingSession);
+                      }}
+                      style={[
+                        styles.pendingDeleteButton,
+                        (isUploading || isUploadingAll || isRecording) && styles.buttonDisabled,
+                      ]}
+                    >
+                      <Ionicons name="trash-outline" size={17} color="#FCA5A5" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })
+          )}
+        </View>
 
         <View style={styles.sessionsPanel}>
           <Text style={styles.panelLabel}>Recent Convex sessions</Text>
@@ -737,7 +1165,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         </View>
         </ScrollView>
       </TouchableWithoutFeedback>
-      <BottomNav />
+      {isRecording ? null : <BottomNav />}
     </View>
   );
 }
@@ -1161,6 +1589,14 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.08)',
     padding: 14,
+    marginBottom: 14,
+  },
+  panelHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 10,
   },
   panelLabel: {
     color: '#E2E8F0',
@@ -1169,9 +1605,96 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     textTransform: 'uppercase',
   },
+  panelLabelInHeader: {
+    marginBottom: 0,
+  },
   emptyText: {
     color: '#94A3B8',
     fontSize: 14,
+  },
+  uploadAllButton: {
+    minHeight: 34,
+    borderRadius: 8,
+    backgroundColor: '#38BDF8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 6,
+    paddingHorizontal: 10,
+  },
+  uploadAllButtonText: {
+    color: '#0F172A',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  pendingSessionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.06)',
+  },
+  pendingSessionTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  pendingStatus: {
+    overflow: 'hidden',
+    borderRadius: 999,
+    backgroundColor: 'rgba(56, 189, 248, 0.14)',
+    color: '#BAE6FD',
+    fontSize: 10,
+    fontWeight: '800',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    textTransform: 'uppercase',
+  },
+  pendingStatusFailed: {
+    backgroundColor: 'rgba(239, 68, 68, 0.14)',
+    color: '#FCA5A5',
+  },
+  pendingStatusUploading: {
+    backgroundColor: 'rgba(34, 197, 94, 0.14)',
+    color: '#86EFAC',
+  },
+  pendingError: {
+    color: '#FCA5A5',
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 5,
+  },
+  pendingActions: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  pendingUploadButton: {
+    minHeight: 38,
+    minWidth: 86,
+    borderRadius: 8,
+    backgroundColor: '#38BDF8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 6,
+    paddingHorizontal: 10,
+  },
+  pendingUploadButtonText: {
+    color: '#0F172A',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  pendingDeleteButton: {
+    minHeight: 38,
+    minWidth: 38,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(248, 113, 113, 0.28)',
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   sessionRow: {
     flexDirection: 'row',

@@ -1,11 +1,14 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Keyboard,
+  LayoutChangeEvent,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -20,6 +23,18 @@ type SignUpAttemptResult = {
   createdSessionId: string | null;
   missingFields?: string[];
   unverifiedFields?: string[];
+};
+
+type SignInFactor = {
+  strategy?: string;
+  emailAddressId?: string;
+  safeIdentifier?: string;
+};
+
+type SignInAttemptResult = {
+  status: string | null;
+  createdSessionId: string | null;
+  supportedFirstFactors?: SignInFactor[] | null;
 };
 
 function getAuthErrorMessage(error: unknown) {
@@ -64,10 +79,52 @@ function getMissingFields(result: SignUpAttemptResult) {
   return result.missingFields ?? [];
 }
 
+function getSupportedSignInStrategies(result: SignInAttemptResult) {
+  return (result.supportedFirstFactors ?? [])
+    .map((factor) => factor.strategy)
+    .filter((strategy): strategy is string => Boolean(strategy));
+}
+
+function getUnsupportedSignInMessage(result: SignInAttemptResult) {
+  const strategies = getSupportedSignInStrategies(result);
+
+  if (result.status === 'needs_second_factor') {
+    return 'This account has multi-factor authentication enabled. This app does not support MFA yet. Disable MFA for this test account or use another contributor account.';
+  }
+
+  if (strategies.length > 0) {
+    return `This account requires a sign-in method that is not fully enabled in the app yet: ${strategies.join(', ')}. Use an email/password contributor account or enable email code sign-in.`;
+  }
+
+  return `This account requires another sign-in step that is not enabled in the app yet. Clerk status: ${result.status ?? 'unknown'}.`;
+}
+
+async function prepareEmailCodeSignIn(
+  result: SignInAttemptResult,
+  prepareFirstFactor: (params: { strategy: 'email_code'; emailAddressId: string }) => Promise<unknown>,
+) {
+  const emailCodeFactor = result.supportedFirstFactors?.find(
+    (factor) => factor.strategy === 'email_code' && factor.emailAddressId,
+  );
+
+  if (!emailCodeFactor?.emailAddressId) {
+    return false;
+  }
+
+  await prepareFirstFactor({
+    strategy: 'email_code',
+    emailAddressId: emailCodeFactor.emailAddressId,
+  });
+
+  return true;
+}
+
 export function ContributorAuthGate() {
   const insets = useSafeAreaInsets();
   const signInState = useSignIn();
   const signUpState = useSignUp();
+  const scrollViewRef = useRef<ScrollView>(null);
+  const inputPositions = useRef<Record<string, number>>({});
   const [mode, setMode] = useState<'signIn' | 'signUp'>('signIn');
   const [username, setUsername] = useState('');
   const [firstName, setFirstName] = useState('');
@@ -76,6 +133,7 @@ export function ContributorAuthGate() {
   const [password, setPassword] = useState('');
   const [verificationCode, setVerificationCode] = useState('');
   const [pendingVerification, setPendingVerification] = useState(false);
+  const [pendingVerificationFlow, setPendingVerificationFlow] = useState<'signIn' | 'signUp' | null>(null);
   const [missingSignUpFields, setMissingSignUpFields] = useState<string[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -84,9 +142,24 @@ export function ContributorAuthGate() {
   const isLoaded = signInState.isLoaded && signUpState.isLoaded;
   const hasMissingSignUpFields = missingSignUpFields.length > 0;
 
+  const registerInputPosition = (key: string) => (event: LayoutChangeEvent) => {
+    inputPositions.current[key] = event.nativeEvent.layout.y;
+  };
+
+  const focusInput = (key: string) => {
+    setTimeout(() => {
+      const y = inputPositions.current[key] ?? 0;
+      scrollViewRef.current?.scrollTo({
+        y: Math.max(y - 120, 0),
+        animated: true,
+      });
+    }, 180);
+  };
+
   const switchMode = (nextMode: 'signIn' | 'signUp') => {
     setMode(nextMode);
     setPendingVerification(false);
+    setPendingVerificationFlow(null);
     setMissingSignUpFields([]);
     setVerificationCode('');
     setStatusMessage(null);
@@ -102,8 +175,8 @@ export function ContributorAuthGate() {
     const nextUsername = username.trim();
     const nextFirstName = firstName.trim();
     const nextLastName = lastName.trim();
-    if (!nextEmail || !password) {
-      setErrorMessage('Enter an email address and password.');
+    if (!nextEmail || (mode === 'signUp' && !password)) {
+      setErrorMessage(mode === 'signUp' ? 'Enter an email address and password.' : 'Enter an email address.');
       return;
     }
 
@@ -119,17 +192,34 @@ export function ContributorAuthGate() {
       setMissingSignUpFields([]);
 
       if (mode === 'signIn') {
-        const result = await signInState.signIn.create({
-          identifier: nextEmail,
-          password,
-        });
+        const result = await signInState.signIn.create(
+          password
+            ? {
+                identifier: nextEmail,
+                password,
+              }
+            : {
+                identifier: nextEmail,
+              },
+        );
 
         if (result.status === 'complete' && result.createdSessionId && signInState.setActive) {
           await signInState.setActive({ session: result.createdSessionId });
           return;
         }
 
-        setErrorMessage('This account requires another sign-in step that is not enabled in the app yet.');
+        if (result.status === 'needs_first_factor') {
+          const didPrepareEmailCode = await prepareEmailCodeSignIn(result, signInState.signIn.prepareFirstFactor);
+
+          if (didPrepareEmailCode) {
+            setPendingVerification(true);
+            setPendingVerificationFlow('signIn');
+            setStatusMessage('Check your email and enter the sign-in code.');
+            return;
+          }
+        }
+
+        setErrorMessage(getUnsupportedSignInMessage(result));
         return;
       }
 
@@ -149,6 +239,7 @@ export function ContributorAuthGate() {
       if (result.unverifiedFields.includes('email_address')) {
         await signUpState.signUp.prepareEmailAddressVerification({ strategy: 'email_code' });
         setPendingVerification(true);
+        setPendingVerificationFlow('signUp');
         setStatusMessage('Check your email and enter the verification code.');
         return;
       }
@@ -168,7 +259,7 @@ export function ContributorAuthGate() {
   };
 
   const submitVerification = async () => {
-    if (!signUpState.isLoaded || isSubmitting) {
+    if (!signUpState.isLoaded || !signInState.isLoaded || isSubmitting) {
       return;
     }
 
@@ -180,6 +271,21 @@ export function ContributorAuthGate() {
     try {
       setIsSubmitting(true);
       setErrorMessage(null);
+
+      if (pendingVerificationFlow === 'signIn') {
+        const result = await signInState.signIn.attemptFirstFactor({
+          strategy: 'email_code',
+          code: verificationCode.trim(),
+        });
+
+        if (result.status === 'complete' && result.createdSessionId && signInState.setActive) {
+          await signInState.setActive({ session: result.createdSessionId });
+          return;
+        }
+
+        setErrorMessage(getUnsupportedSignInMessage(result));
+        return;
+      }
 
       const result = await signUpState.signUp.attemptEmailAddressVerification({
         code: verificationCode.trim(),
@@ -238,6 +344,7 @@ export function ContributorAuthGate() {
         await signUpState.signUp.prepareEmailAddressVerification({ strategy: 'email_code' });
         setMissingSignUpFields([]);
         setPendingVerification(true);
+        setPendingVerificationFlow('signUp');
         setStatusMessage('Check your email and enter the verification code.');
         return;
       }
@@ -254,14 +361,17 @@ export function ContributorAuthGate() {
   return (
     <View style={[styles.safeArea, { paddingTop: insets.top }]}>
       <StatusBar style="light" />
-      <ScrollView
-        contentContainerStyle={[
-          styles.screen,
-          styles.authScreen,
-          { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 24 },
-        ]}
-        keyboardShouldPersistTaps="handled"
-      >
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <ScrollView
+          ref={scrollViewRef}
+          contentContainerStyle={[
+            styles.screen,
+            styles.authScreen,
+            { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 140 },
+          ]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+        >
         <View style={styles.header}>
           <Text style={styles.heading}>Contributor access</Text>
           <Text style={styles.subtitle}>
@@ -289,6 +399,8 @@ export function ContributorAuthGate() {
 
           {isSignUp && (!pendingVerification || missingSignUpFields.includes('username')) ? (
             <TextInput
+              onLayout={registerInputPosition('username')}
+              onFocus={() => focusInput('username')}
               value={username}
               onChangeText={setUsername}
               placeholder="Username"
@@ -303,6 +415,8 @@ export function ContributorAuthGate() {
           {isSignUp && (!pendingVerification || hasMissingSignUpFields) ? (
             <View style={styles.nameRow}>
               <TextInput
+                onLayout={registerInputPosition('firstName')}
+                onFocus={() => focusInput('firstName')}
                 value={firstName}
                 onChangeText={setFirstName}
                 placeholder="First name"
@@ -312,6 +426,8 @@ export function ContributorAuthGate() {
                 style={[styles.input, styles.nameInput]}
               />
               <TextInput
+                onLayout={registerInputPosition('lastName')}
+                onFocus={() => focusInput('lastName')}
                 value={lastName}
                 onChangeText={setLastName}
                 placeholder="Last name"
@@ -324,6 +440,8 @@ export function ContributorAuthGate() {
           ) : null}
 
           <TextInput
+            onLayout={registerInputPosition('email')}
+            onFocus={() => focusInput('email')}
             value={email}
             onChangeText={setEmail}
             placeholder="Email"
@@ -335,9 +453,11 @@ export function ContributorAuthGate() {
             style={styles.input}
           />
           <TextInput
+            onLayout={registerInputPosition('password')}
+            onFocus={() => focusInput('password')}
             value={password}
             onChangeText={setPassword}
-            placeholder="Password"
+            placeholder={isSignUp ? 'Password' : 'Password or leave empty for email code'}
             placeholderTextColor="#64748B"
             autoCapitalize="none"
             secureTextEntry
@@ -347,6 +467,8 @@ export function ContributorAuthGate() {
 
           {pendingVerification ? (
             <TextInput
+              onLayout={registerInputPosition('verificationCode')}
+              onFocus={() => focusInput('verificationCode')}
               value={verificationCode}
               onChangeText={setVerificationCode}
               placeholder="Email verification code"
@@ -411,7 +533,8 @@ export function ContributorAuthGate() {
             </Text>
           </TouchableOpacity>
         </View>
-      </ScrollView>
+        </ScrollView>
+      </TouchableWithoutFeedback>
       <BottomNav />
     </View>
   );

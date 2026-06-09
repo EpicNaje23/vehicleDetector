@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { useAuth } from '@clerk/clerk-expo';
 import { Ionicons } from '@expo/vector-icons';
@@ -72,6 +72,7 @@ function MissingConvexConfig() {
 export default function DatasetMapScreen() {
   const insets = useSafeAreaInsets();
   const { isLoaded, userId } = useAuth();
+  const mapRef = useRef<MapView>(null);
   const mapSessions = useQuery(api.dataset.listMapSessions, isLoaded && userId ? {} : 'skip');
 
   useEffect(() => {
@@ -79,6 +80,48 @@ export default function DatasetMapScreen() {
       router.replace('/account');
     }
   }, [isLoaded, userId]);
+
+  useEffect(() => {
+    if (!mapSessions || mapSessions.length === 0) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      if (mapSessions.length === 1) {
+        const session = mapSessions[0];
+        mapRef.current?.animateToRegion(
+          {
+            latitude: session.latitude,
+            longitude: session.longitude,
+            latitudeDelta: 0.08,
+            longitudeDelta: 0.08,
+          },
+          700,
+        );
+        return;
+      }
+
+      mapRef.current?.fitToCoordinates(
+        mapSessions.map((session) => ({
+          latitude: session.latitude,
+          longitude: session.longitude,
+        })),
+        {
+          animated: true,
+          edgePadding: {
+            top: Math.max(insets.top + 130, 170),
+            right: 48,
+            bottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 72,
+            left: 48,
+          },
+        },
+      );
+    }, 350);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [insets.bottom, insets.top, mapSessions]);
 
   if (!CONVEX_URL) {
     return <MissingConvexConfig />;
@@ -96,6 +139,7 @@ export default function DatasetMapScreen() {
     <View style={styles.safeArea}>
       <StatusBar style="light" />
       <MapView
+        ref={mapRef}
         provider={PROVIDER_DEFAULT}
         style={styles.map}
         initialRegion={EUROPE_REGION}

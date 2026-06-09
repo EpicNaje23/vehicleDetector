@@ -5,6 +5,28 @@ function roundCoordinate(value: number) {
   return Math.round(value * 1000) / 1000;
 }
 
+export const debugCurrentIdentity = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+
+    return {
+      tokenIdentifier: identity.tokenIdentifier,
+      subject: identity.subject,
+      issuer: identity.issuer,
+      name: identity.name ?? null,
+      email: identity.email ?? null,
+      nickname: identity.nickname ?? null,
+      preferredUsername: identity.preferredUsername ?? null,
+      givenName: identity.givenName ?? null,
+      familyName: identity.familyName ?? null,
+    };
+  },
+});
+
 export const generateUploadUrl = mutation({
   args: {},
   handler: async (ctx) => {
