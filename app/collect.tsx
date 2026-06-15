@@ -2,13 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Keyboard,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -29,7 +27,10 @@ import type { Id } from '@/convex/_generated/dataModel';
 
 const CONVEX_URL = process.env.EXPO_PUBLIC_CONVEX_URL;
 const CLERK_PUBLISHABLE_KEY = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY;
-const MAX_SESSION_SECONDS = 30 * 60;
+const MAX_SESSION_SECONDS = 20 * 60;
+const COLLECTION_VIDEO_BITRATE = 500_000;
+const MAX_UPLOAD_BYTES = 150 * 1024 * 1024;
+const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const COLLECTION_CONSENT_KEY = 'carzam_collection_consent_v1';
 const PENDING_SESSIONS_FOLDER = 'carzam-sessions';
 const PENDING_SESSIONS_MANIFEST = 'pending-sessions.json';
@@ -58,13 +59,36 @@ type PendingSession = SessionDraft & {
   videoUri: string;
   fileName: string;
   fileType: string;
-  locationName: string;
   device: string;
   fileSizeBytes?: number;
   savedAt: string;
   status: PendingUploadStatus;
   lastError?: string;
 };
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMillis: number,
+  message: string,
+  onTimeout?: () => void,
+) {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(message));
+    }, timeoutMillis);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
 
 type CollectScreenContentProps = {
   contributorName: string;
@@ -151,7 +175,6 @@ function parsePendingSession(value: unknown): PendingSession | null {
     typeof record.videoUri !== 'string' ||
     typeof record.fileName !== 'string' ||
     typeof record.fileType !== 'string' ||
-    typeof record.locationName !== 'string' ||
     typeof record.device !== 'string' ||
     typeof record.startedAt !== 'string' ||
     typeof record.endedAt !== 'string' ||
@@ -166,7 +189,6 @@ function parsePendingSession(value: unknown): PendingSession | null {
     videoUri: record.videoUri,
     fileName: record.fileName,
     fileType: record.fileType,
-    locationName: record.locationName,
     device: record.device,
     startedAt: record.startedAt,
     endedAt: record.endedAt,
@@ -215,6 +237,16 @@ function getDeviceLabel() {
   const os = [Device.osName, Device.osVersion].filter(Boolean).join(' ');
 
   return [maker, model, os].filter(Boolean).join(' · ');
+}
+
+function getSessionDisplayName(session: { startedAt?: string; sessionId: string }) {
+  const timestamp = session.startedAt ? new Date(session.startedAt) : null;
+
+  if (timestamp && Number.isFinite(timestamp.getTime())) {
+    return `Session ${timestamp.toLocaleDateString([], { day: '2-digit', month: 'short' })}, ${timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  return session.sessionId;
 }
 
 export default function CollectScreen() {
@@ -309,14 +341,12 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const convexAuth = useConvexAuth();
   const scrollViewRef = useRef<ScrollView>(null);
   const cameraRef = useRef<CameraView>(null);
-  const locationInputY = useRef(0);
   const hasAutoRequestedMediaPermissions = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [microphonePermission, requestMicrophonePermission] = useMicrophonePermissions();
   const generateUploadUrl = useMutation(api.dataset.generateUploadUrl);
   const createSession = useMutation(api.dataset.createSession);
   const recentSessions = useQuery(api.dataset.listRecentSessions, convexAuth.isAuthenticated ? {} : 'skip');
-  const [locationName, setLocationName] = useState('');
   const [sessionDraft, setSessionDraft] = useState<SessionDraft | null>(null);
   const pendingSessionsRef = useRef<PendingSession[]>([]);
   const [pendingSessions, setPendingSessions] = useState<PendingSession[]>([]);
@@ -331,6 +361,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const [hasAcceptedCollectionConsent, setHasAcceptedCollectionConsent] = useState(false);
   const [isConsentLoaded, setIsConsentLoaded] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [uploadPhase, setUploadPhase] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
@@ -338,9 +369,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   const hasMicrophoneAccess = microphonePermission?.granted ?? false;
   const mediaPermissionsLoaded = cameraPermission !== null && microphonePermission !== null;
   const hasMediaAccess = hasCameraAccess && hasMicrophoneAccess;
-  const trimmedLocationName = locationName.trim();
   const canStartSession =
-    Boolean(trimmedLocationName) &&
     hasMediaAccess &&
     hasAcceptedCollectionConsent &&
     isPendingSessionsLoaded &&
@@ -504,10 +533,9 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     }
   }, [mediaPermissionsLoaded, hasMediaAccess, requestMediaPermissions]);
 
-  const ensurePermissions = async () => {
+  const ensureMediaPermissions = async () => {
     const nextCamera = hasCameraAccess ? cameraPermission : await requestCameraPermission();
     const nextMicrophone = hasMicrophoneAccess ? microphonePermission : await requestMicrophonePermission();
-    const nextLocation = await Location.requestForegroundPermissionsAsync();
 
     if (!nextCamera?.granted) {
       return 'Camera permission is required to record dataset sessions.';
@@ -517,15 +545,24 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       return 'Microphone permission is required to record dataset sessions.';
     }
 
-    if (!nextLocation.granted) {
-      return 'Location permission is required to save dataset coordinates.';
-    }
-
     return null;
   };
 
+  const getOptionalRecordingLocation = async () => {
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+      if (!permission.granted) {
+        return null;
+      }
+
+      return await Location.getCurrentPositionAsync({});
+    } catch {
+      return null;
+    }
+  };
+
   const saveRecordingToOutbox = useCallback(
-    async (recordingUri: string, draft: SessionDraft, savedLocationName: string) => {
+    async (recordingUri: string, draft: SessionDraft) => {
       const sourceInfo = await FileSystem.getInfoAsync(recordingUri);
 
       if (!sourceInfo.exists) {
@@ -560,7 +597,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         videoUri: persistentUri,
         fileName,
         fileType: getVideoFileType(extension),
-        locationName: savedLocationName,
         device: getDeviceLabel(),
         fileSizeBytes,
         savedAt: new Date().toISOString(),
@@ -587,12 +623,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       return;
     }
 
-    if (!trimmedLocationName) {
-      setErrorMessage('Enter a location name before starting a recording session.');
-      scrollToLocationInput();
-      return;
-    }
-
     if (!hasAcceptedCollectionConsent) {
       setErrorMessage('Review and accept the data collection notice before recording.');
       return;
@@ -604,16 +634,16 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       setErrorMessage(null);
       setSuccessMessage(null);
       setUploadProgress(null);
+      setUploadPhase(null);
       setSessionDraft(null);
       setElapsedMillis(0);
 
-      const permissionError = await ensurePermissions();
+      const permissionError = await ensureMediaPermissions();
       if (permissionError) {
         setErrorMessage(permissionError);
         return;
       }
 
-      const location = await Location.getCurrentPositionAsync({});
       const startedAtDate = new Date();
       const startedAtMs = startedAtDate.getTime();
       const sessionId = makeSessionId();
@@ -624,9 +654,12 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         setElapsedMillis(Date.now() - startedAtMs);
       }, 500);
 
-      const recording = await cameraRef.current?.recordAsync({
+      const recordingPromise = cameraRef.current?.recordAsync({
         maxDuration: MAX_SESSION_SECONDS,
+        ...(Platform.OS === 'ios' ? { codec: 'avc1' as const } : {}),
       });
+      const locationPromise = getOptionalRecordingLocation();
+      const recording = await recordingPromise;
       const endedAtDate = new Date();
       clearInterval(elapsedTimer);
       elapsedTimer = null;
@@ -636,17 +669,18 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         return;
       }
 
+      const location = await locationPromise;
       const draft = {
         sessionId,
         startedAt: startedAtDate.toISOString(),
         endedAt: endedAtDate.toISOString(),
         durationMillis: endedAtDate.getTime() - startedAtMs,
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        locationAccuracy: location.coords.accuracy ?? undefined,
+        latitude: location?.coords.latitude,
+        longitude: location?.coords.longitude,
+        locationAccuracy: location?.coords.accuracy ?? undefined,
       };
 
-      await saveRecordingToOutbox(recording.uri, draft, trimmedLocationName);
+      await saveRecordingToOutbox(recording.uri, draft);
       setElapsedMillis(draft.durationMillis);
       setSessionDraft(draft);
       setSuccessMessage('Session saved locally. Upload it when the network is stable.');
@@ -672,15 +706,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     cameraRef.current?.stopRecording();
   };
 
-  const scrollToLocationInput = () => {
-    setTimeout(() => {
-      scrollViewRef.current?.scrollTo({
-        y: Math.max(locationInputY.current - 120, 0),
-        animated: true,
-      });
-    }, 180);
-  };
-
   const uploadPendingSession = useCallback(async (pendingSession: PendingSession) => {
     try {
       setErrorMessage(null);
@@ -699,6 +724,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       setIsUploading(true);
       setActiveUploadSessionId(pendingSession.sessionId);
       setUploadProgress({ sentBytes: 0, totalBytes: 0, percent: 0 });
+      setUploadPhase('Preparing upload');
       await updatePendingSession(pendingSession.sessionId, { status: 'uploading', lastError: undefined });
 
       const fileInfo = await FileSystem.getInfoAsync(pendingSession.videoUri);
@@ -709,12 +735,23 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
       const fileSizeBytes = 'size' in fileInfo && typeof fileInfo.size === 'number'
         ? fileInfo.size
         : pendingSession.fileSizeBytes;
+      if (fileSizeBytes !== undefined && fileSizeBytes > MAX_UPLOAD_BYTES) {
+        throw new Error(
+          `This recording is too large to upload (${formatBytes(fileSizeBytes)}). The current upload limit is ${formatBytes(MAX_UPLOAD_BYTES)}. Record again with the new low-bitrate settings.`,
+        );
+      }
+
       setUploadProgress({
         sentBytes: 0,
         totalBytes: fileSizeBytes ?? 0,
         percent: 0,
       });
-      const uploadUrl = await generateUploadUrl();
+      const uploadUrl = await withTimeout(
+        generateUploadUrl(),
+        UPLOAD_TIMEOUT_MS,
+        'Upload timed out while preparing Convex storage. Check your connection and try again.',
+      );
+      setUploadPhase('Uploading recording');
       const uploadTask = FileSystem.createUploadTask(uploadUrl, pendingSession.videoUri, {
         httpMethod: 'POST',
         uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
@@ -733,8 +770,16 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
           totalBytes,
           percent,
         });
+        setUploadPhase(totalBytes > 0 ? `Uploading ${percent}%` : 'Uploading recording');
       });
-      const uploadResponse = await uploadTask.uploadAsync();
+      const uploadResponse = await withTimeout(
+        uploadTask.uploadAsync(),
+        UPLOAD_TIMEOUT_MS,
+        'Upload timed out. Check your connection and try again.',
+        () => {
+          void uploadTask.cancelAsync().catch(() => {});
+        },
+      );
 
       if (!uploadResponse) {
         throw new Error('Convex storage upload did not return a response.');
@@ -749,24 +794,29 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
         throw new Error('Convex storage upload did not return a storage ID.');
       }
 
-      await createSession({
-        sessionId: pendingSession.sessionId,
-        startedAt: pendingSession.startedAt,
-        endedAt: pendingSession.endedAt,
-        durationMillis: pendingSession.durationMillis,
-        latitude: pendingSession.latitude,
-        longitude: pendingSession.longitude,
-        locationAccuracy: pendingSession.locationAccuracy,
-        storageId: storageId as Id<'_storage'>,
-        fileName: pendingSession.fileName,
-        fileType: pendingSession.fileType,
-        locationName: pendingSession.locationName,
-        device: pendingSession.device,
-        fileSizeBytes,
-        uploadedAt: Date.now(),
-      });
+      setUploadPhase('Saving session metadata');
+      await withTimeout(
+        createSession({
+          sessionId: pendingSession.sessionId,
+          startedAt: pendingSession.startedAt,
+          endedAt: pendingSession.endedAt,
+          durationMillis: pendingSession.durationMillis,
+          latitude: pendingSession.latitude,
+          longitude: pendingSession.longitude,
+          locationAccuracy: pendingSession.locationAccuracy,
+          storageId: storageId as Id<'_storage'>,
+          fileName: pendingSession.fileName,
+          fileType: pendingSession.fileType,
+          device: pendingSession.device,
+          fileSizeBytes,
+          uploadedAt: Date.now(),
+        }),
+        UPLOAD_TIMEOUT_MS,
+        'Upload timed out while saving session metadata. Check your connection and try again.',
+      );
 
       setUploadProgress({ sentBytes: fileSizeBytes ?? 0, totalBytes: fileSizeBytes ?? 0, percent: 100 });
+      setUploadPhase('Upload complete');
       await persistPendingSessions(
         pendingSessionsRef.current.filter((session) => session.sessionId !== pendingSession.sessionId),
       );
@@ -788,6 +838,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
     } finally {
       setIsUploading(false);
       setActiveUploadSessionId(null);
+      setUploadPhase(null);
     }
   }, [
     convexAuth.isAuthenticated,
@@ -842,19 +893,18 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
   return (
     <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
       <StatusBar style="light" />
-      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-        <ScrollView
-          ref={scrollViewRef}
-          contentContainerStyle={[
-            styles.screen,
-            { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 140 },
-          ]}
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="on-drag"
-        >
+      <ScrollView
+        ref={scrollViewRef}
+        contentContainerStyle={[
+          styles.screen,
+          { paddingBottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 140 },
+        ]}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
           <View style={styles.header}>
             <Text style={styles.heading}>Collect dataset</Text>
-            <Text style={styles.subtitle}>Record long video sessions now. Annotate the vehicles later.</Text>
+            <Text style={styles.subtitle}>Record continuous 20-minute low-bitrate sessions. Annotate the vehicles later.</Text>
           </View>
 
         <View style={styles.contributorCard}>
@@ -877,7 +927,8 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
               style={styles.camera}
               facing="back"
               mode="video"
-              videoQuality="480p"
+              videoBitrate={COLLECTION_VIDEO_BITRATE}
+              videoQuality="4:3"
             />
           ) : (
             <View style={styles.cameraPlaceholder}>
@@ -916,14 +967,15 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
               <View style={styles.guidanceTextBlock}>
                 <Text style={styles.guidanceTitle}>Collection notice</Text>
                 <Text style={styles.guidanceBody}>
-                  Uploads include video, audio, approximate location, device info, and your contributor account for research/data collection.
+                  CarZam collects traffic video and audio to build an academic vehicle sound dataset and improve vehicle sound classification.
                 </Text>
               </View>
             </View>
             <View style={styles.guidanceList}>
-              <Text style={styles.guidanceItem}>Record vehicles in public or safe outdoor areas.</Text>
-              <Text style={styles.guidanceItem}>Avoid filming faces, private spaces, and sensitive information.</Text>
-              <Text style={styles.guidanceItem}>Use a clear location name such as city, street, or station area.</Text>
+              <Text style={styles.guidanceItem}>Collected data: video, audio, approximate GPS coordinates, GPS accuracy, timestamps, duration, file size, device information, and your contributor account.</Text>
+              <Text style={styles.guidanceItem}>Purpose: dataset collection, manual annotation, model evaluation, and improving the vehicle classifier.</Text>
+              <Text style={styles.guidanceItem}>Privacy: avoid filming faces, private spaces, sensitive locations, and license plates when possible.</Text>
+              <Text style={styles.guidanceItem}>Control: completed recordings stay pending on this device until you upload them, and you can delete pending recordings before upload.</Text>
             </View>
             <TouchableOpacity
               activeOpacity={0.85}
@@ -936,22 +988,6 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
             </TouchableOpacity>
           </View>
         ) : null}
-
-        <View
-          style={styles.formPanel}
-          onLayout={(event) => {
-            locationInputY.current = event.nativeEvent.layout.y;
-          }}
-        >
-          <TextInput
-            value={locationName}
-            onChangeText={setLocationName}
-            onFocus={scrollToLocationInput}
-            placeholder="Location name *"
-            placeholderTextColor="#64748B"
-            style={styles.input}
-          />
-        </View>
 
         <View style={styles.metricsRow}>
           <View style={styles.metricPill}>
@@ -972,13 +1008,14 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
           <View style={styles.uploadProgressPanel}>
             <View style={styles.uploadProgressHeader}>
               <Text style={styles.uploadProgressTitle}>
-                {isUploading
-                  ? uploadProgress?.totalBytes
-                    ? `Uploading ${uploadProgress.percent}%`
-                    : 'Preparing upload'
-                  : uploadProgress?.percent === 100
-                    ? 'Upload complete'
-                    : 'Upload stopped'}
+                {uploadPhase ??
+                  (isUploading
+                    ? uploadProgress?.totalBytes
+                      ? `Uploading ${uploadProgress.percent}%`
+                      : 'Preparing upload'
+                    : uploadProgress?.percent === 100
+                      ? 'Upload complete'
+                      : 'Upload stopped')}
               </Text>
               <Text style={styles.uploadProgressBytes}>
                 {uploadProgress
@@ -1071,7 +1108,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
                 <View key={pendingSession.sessionId} style={styles.pendingSessionRow}>
                   <View style={styles.sessionInfo}>
                     <View style={styles.pendingSessionTitleRow}>
-                      <Text numberOfLines={1} style={styles.sessionTitle}>{pendingSession.locationName}</Text>
+                      <Text numberOfLines={1} style={styles.sessionTitle}>{getSessionDisplayName(pendingSession)}</Text>
                       <Text style={[
                         styles.pendingStatus,
                         statusLabel === 'failed' && styles.pendingStatusFailed,
@@ -1151,7 +1188,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
               return (
                 <View key={session._id} style={styles.sessionRow}>
                   <View style={styles.sessionInfo}>
-                    <Text style={styles.sessionTitle}>{session.locationName || session.sessionId}</Text>
+                    <Text style={styles.sessionTitle}>{getSessionDisplayName(session)}</Text>
                     <Text numberOfLines={1} style={styles.sessionContributor}>
                       {contributorDetail ? `${contributorLabel} · ${contributorDetail}` : contributorLabel}
                     </Text>
@@ -1163,8 +1200,7 @@ function CollectScreenContent({ contributorName, contributorEmail }: CollectScre
             })
           )}
         </View>
-        </ScrollView>
-      </TouchableWithoutFeedback>
+      </ScrollView>
       {isRecording ? null : <BottomNav />}
     </View>
   );
@@ -1433,20 +1469,6 @@ const styles = StyleSheet.create({
   },
   consentButtonTextAccepted: {
     color: '#86EFAC',
-  },
-  formPanel: {
-    gap: 10,
-    marginBottom: 14,
-  },
-  input: {
-    minHeight: 48,
-    borderRadius: 8,
-    backgroundColor: '#0B1220',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-    color: '#E2E8F0',
-    paddingHorizontal: 14,
-    fontSize: 15,
   },
   nameRow: {
     flexDirection: 'row',

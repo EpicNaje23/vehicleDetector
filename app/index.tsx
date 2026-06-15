@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
+  Easing,
   Modal,
   ScrollView,
   StyleSheet,
@@ -12,7 +14,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
+import { RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, useAudioRecorder } from 'expo-audio';
+import { useConvex, useConvexAuth, useQuery } from 'convex/react';
 import { BottomNav, BOTTOM_NAV_HEIGHT } from '@/components/BottomNav';
+import { api } from '@/convex/_generated/api';
+import type { Id } from '@/convex/_generated/dataModel';
 
 const DEFAULT_SERVER_URL = process.env.EXPO_PUBLIC_AUDIO_API_URL ?? '';
 
@@ -258,6 +264,41 @@ function formatConfidence(confidence: number) {
   return `${Math.round(confidence * 100)}%`;
 }
 
+function formatDuration(durationMillis: number) {
+  const totalSeconds = Math.max(0, Math.floor(durationMillis / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+
+  return `${minutes}:${seconds}`;
+}
+
+function formatBytes(bytes?: number | null) {
+  if (bytes === undefined || bytes === null) {
+    return '';
+  }
+
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const megabytes = bytes / (1024 * 1024);
+  if (megabytes >= 1) {
+    return `${megabytes.toFixed(1)} MB`;
+  }
+
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function getSessionDisplayName(session: { startedAt?: string; sessionId: string }) {
+  const timestamp = session.startedAt ? new Date(session.startedAt) : null;
+
+  if (timestamp && Number.isFinite(timestamp.getTime())) {
+    return `Session ${timestamp.toLocaleDateString([], { day: '2-digit', month: 'short' })}, ${timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  return session.sessionId;
+}
+
 function buildPrediction(body: unknown): Omit<Prediction, 'id' | 'createdAt'> {
   const raw = stringifyResponse(body);
   let parsed = body;
@@ -346,11 +387,70 @@ function WaveformEnvelope({ waveform }: { waveform?: PredictionWaveform }) {
 }
 
 export default function HomeScreen() {
+  const convex = useConvex();
+  const convexAuth = useConvexAuth();
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const predictionSessions = useQuery(api.dataset.listPredictionSessions, convexAuth.isAuthenticated ? {} : 'skip');
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+  const recordingStartedAtRef = useRef<number | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [recordingElapsedMillis, setRecordingElapsedMillis] = useState(0);
+  const [isSessionPickerVisible, setIsSessionPickerVisible] = useState(false);
   const [recentPredictions, setRecentPredictions] = useState<Prediction[]>([]);
   const [selectedPrediction, setSelectedPrediction] = useState<Prediction | null>(null);
   const insets = useSafeAreaInsets();
+
+  useEffect(() => {
+    if (!isRecordingAudio) {
+      pulseAnim.stopAnimation();
+      pulseAnim.setValue(0);
+      recordingStartedAtRef.current = null;
+      setRecordingElapsedMillis(0);
+      return undefined;
+    }
+
+    recordingStartedAtRef.current = Date.now();
+    setRecordingElapsedMillis(0);
+
+    const timer = setInterval(() => {
+      if (recordingStartedAtRef.current !== null) {
+        setRecordingElapsedMillis(Date.now() - recordingStartedAtRef.current);
+      }
+    }, 250);
+
+    const pulseLoop = Animated.loop(
+      Animated.timing(pulseAnim, {
+        toValue: 1,
+        duration: 1500,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+    );
+    pulseLoop.start();
+
+    return () => {
+      clearInterval(timer);
+      pulseLoop.stop();
+      pulseAnim.setValue(0);
+    };
+  }, [isRecordingAudio, pulseAnim]);
+
+  const savePrediction = (body: unknown) => {
+    const prediction = buildPrediction(body);
+    const nextPrediction = {
+      ...prediction,
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      createdAt: Date.now(),
+    };
+
+    setRecentPredictions((current) => [
+      nextPrediction,
+      ...current,
+    ].slice(0, 20));
+    setSelectedPrediction(nextPrediction);
+  };
 
   const uploadAudioFile = async (audioUri: string, fileName?: string | null, mimeType?: string | null) => {
     if (!DEFAULT_SERVER_URL.trim()) {
@@ -379,18 +479,37 @@ export default function HomeScreen() {
       throw new Error(stringifyResponse(body) || `Prediction failed with status ${response.status}.`);
     }
 
-    const prediction = buildPrediction(body);
-    const nextPrediction = {
-      ...prediction,
-      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      createdAt: Date.now(),
-    };
+    savePrediction(body);
+  };
 
-    setRecentPredictions((current) => [
-      nextPrediction,
-      ...current,
-    ].slice(0, 20));
-    setSelectedPrediction(nextPrediction);
+  const predictFromSourceUrl = async (sourceUrl: string, fileName: string, mimeType: string) => {
+    if (!DEFAULT_SERVER_URL.trim()) {
+      throw new Error('Missing EXPO_PUBLIC_AUDIO_API_URL for predictions.');
+    }
+
+    const response = await fetch(DEFAULT_SERVER_URL.trim(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        source: 'convex-session',
+        sourceUrl,
+        fileName,
+        mimeType,
+      }),
+    });
+
+    const contentType = response.headers.get('content-type') ?? '';
+    const body = contentType.includes('application/json') ? await response.json() : await response.text();
+
+    if (!response.ok) {
+      throw new Error(
+        `Prediction from collected sessions requires backend support for signed media URLs. Server returned ${response.status}: ${stringifyResponse(body)}`,
+      );
+    }
+
+    savePrediction(body);
   };
 
   const pickAndPredict = async () => {
@@ -421,6 +540,80 @@ export default function HomeScreen() {
     }
   };
 
+  const startAudioPredictionRecording = async () => {
+    if (isSubmitting || isRecordingAudio) {
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      const permission = await requestRecordingPermissionsAsync();
+      if (!permission.granted) {
+        setErrorMessage('Microphone permission is required to record an audio sample.');
+        return;
+      }
+
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+      });
+      await recorder.prepareToRecordAsync();
+      recorder.record();
+      setIsRecordingAudio(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to start audio recording.';
+      setErrorMessage(message);
+      setIsRecordingAudio(false);
+    }
+  };
+
+  const stopAudioPredictionRecording = async () => {
+    if (!isRecordingAudio || isSubmitting) {
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      setIsSubmitting(true);
+      await recorder.stop();
+      const uri = recorder.uri;
+      if (!uri) {
+        throw new Error('Audio recording stopped, but no file was created.');
+      }
+
+      await uploadAudioFile(uri, getFileName(uri, 'recorded-sample.m4a'), 'audio/mp4');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to predict recorded audio.';
+      setErrorMessage(message);
+    } finally {
+      setIsRecordingAudio(false);
+      setIsSubmitting(false);
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      }).catch(() => {});
+    }
+  };
+
+  const predictFromCollectedSession = async (sessionId: Id<'sessions'>) => {
+    if (isSubmitting) {
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      setIsSubmitting(true);
+      setIsSessionPickerVisible(false);
+      const sessionFile = await convex.query(api.dataset.getSessionPredictionUrl, { sessionId });
+      await predictFromSourceUrl(sessionFile.url, sessionFile.fileName, sessionFile.fileType);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to predict from collected session.';
+      setErrorMessage(message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <View style={[styles.safeArea, { paddingTop: insets.top }]}> 
       <StatusBar style="light" />
@@ -428,20 +621,103 @@ export default function HomeScreen() {
         <Text style={styles.heading}>CarZam</Text>
 
         <View style={styles.captureSection}>
-          <TouchableOpacity
-            activeOpacity={0.86}
-            disabled={isSubmitting}
-            style={[styles.listenButton, isSubmitting && styles.listenButtonDisabled]}
-            onPress={pickAndPredict}
-          >
-            {isSubmitting ? (
-              <ActivityIndicator size="large" color="#FFFFFF" />
-            ) : (
-              <Ionicons name="cloud-upload-outline" size={44} color="#FFFFFF" />
-            )}
-            <Text style={styles.listenTitle}>{isSubmitting ? 'Predicting…' : 'Upload audio'}</Text>
-            <Text style={styles.durationText}>WAV, MP3, M4A</Text>
-          </TouchableOpacity>
+          <View style={styles.listenButtonWrap}>
+            {isRecordingAudio ? (
+              <>
+                <Animated.View
+                  pointerEvents="none"
+                  style={[
+                    styles.recordingPulse,
+                    {
+                      opacity: pulseAnim.interpolate({
+                        inputRange: [0, 0.7, 1],
+                        outputRange: [0.48, 0.12, 0],
+                      }),
+                      transform: [
+                        {
+                          scale: pulseAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [1, 1.42],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                />
+                <Animated.View
+                  pointerEvents="none"
+                  style={[
+                    styles.recordingPulse,
+                    styles.recordingPulseDelayed,
+                    {
+                      opacity: pulseAnim.interpolate({
+                        inputRange: [0, 0.35, 1],
+                        outputRange: [0, 0.38, 0],
+                      }),
+                      transform: [
+                        {
+                          scale: pulseAnim.interpolate({
+                            inputRange: [0, 0.35, 1],
+                            outputRange: [0.9, 1, 1.28],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                />
+              </>
+            ) : null}
+            <TouchableOpacity
+              activeOpacity={0.86}
+              disabled={isSubmitting}
+              style={[
+                styles.listenButton,
+                isRecordingAudio && styles.listenButtonRecording,
+                isSubmitting && styles.listenButtonDisabled,
+              ]}
+              onPress={isRecordingAudio ? stopAudioPredictionRecording : startAudioPredictionRecording}
+            >
+              {isSubmitting ? (
+                <ActivityIndicator size="large" color="#FFFFFF" />
+              ) : (
+                <Ionicons name={isRecordingAudio ? 'stop' : 'mic-outline'} size={44} color="#FFFFFF" />
+              )}
+              <Text style={styles.listenTitle}>
+                {isSubmitting ? 'Predicting…' : isRecordingAudio ? 'Stop and predict' : 'Record sample'}
+              </Text>
+              <Text style={[styles.durationText, isRecordingAudio && styles.recordingTimerText]}>
+                {isRecordingAudio ? formatDuration(recordingElapsedMillis) : 'Tap to record'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {!isRecordingAudio ? (
+            <View style={styles.predictionActions}>
+              <TouchableOpacity
+                activeOpacity={0.86}
+                disabled={isSubmitting}
+                onPress={pickAndPredict}
+                style={[
+                  styles.predictionActionButton,
+                  isSubmitting && styles.predictionActionButtonDisabled,
+                ]}
+              >
+                <Ionicons name="cloud-upload-outline" size={18} color="#F8FAFC" />
+                <Text style={styles.predictionActionText}>Upload audio</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                activeOpacity={0.86}
+                disabled={isSubmitting || !convexAuth.isAuthenticated}
+                onPress={() => setIsSessionPickerVisible(true)}
+                style={[
+                  styles.predictionActionButton,
+                  (!convexAuth.isAuthenticated || isSubmitting) && styles.predictionActionButtonDisabled,
+                ]}
+              >
+                <Ionicons name="albums-outline" size={18} color="#F8FAFC" />
+                <Text style={styles.predictionActionText}>Collected session</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
         </View>
 
         {errorMessage ? (
@@ -492,6 +768,68 @@ export default function HomeScreen() {
         </View>
       </View>
       <BottomNav />
+      <Modal
+        animationType="slide"
+        visible={isSessionPickerVisible}
+        presentationStyle="pageSheet"
+        onRequestClose={() => setIsSessionPickerVisible(false)}
+      >
+        <View style={styles.modalScreen}>
+          <TouchableOpacity
+            activeOpacity={0.82}
+            onPress={() => setIsSessionPickerVisible(false)}
+            style={[styles.modalCloseButton, { top: insets.top + 14 }]}
+          >
+            <Ionicons name="close" size={24} color="#F8FAFC" />
+          </TouchableOpacity>
+          <ScrollView
+            contentContainerStyle={[
+              styles.sessionPickerContent,
+              {
+                paddingTop: insets.top + 88,
+                paddingBottom: Math.max(insets.bottom, 20) + 32,
+              },
+            ]}
+          >
+            <Text style={styles.modalLabel}>Choose collected session</Text>
+            <Text style={styles.sessionPickerHelp}>
+              Select one of your uploaded collection recordings. The prediction backend must support signed Convex media URLs.
+            </Text>
+            {predictionSessions === undefined ? (
+              <ActivityIndicator size="small" color="#38BDF8" />
+            ) : predictionSessions.length === 0 ? (
+              <View style={styles.sessionPickerEmpty}>
+                <Ionicons name="albums-outline" size={26} color="#64748B" />
+                <Text style={styles.emptyText}>No uploaded collection sessions yet.</Text>
+              </View>
+            ) : (
+              predictionSessions.map((session) => (
+                <TouchableOpacity
+                  key={session.id}
+                  activeOpacity={0.86}
+                  disabled={isSubmitting}
+                  onPress={() => {
+                    void predictFromCollectedSession(session.id);
+                  }}
+                  style={styles.sessionPickerRow}
+                >
+                  <View style={styles.predictionIcon}>
+                    <Ionicons name="videocam-outline" size={18} color="#38BDF8" />
+                  </View>
+                  <View style={styles.sessionPickerTextBlock}>
+                    <Text numberOfLines={1} style={styles.sessionPickerTitle}>{getSessionDisplayName(session)}</Text>
+                    <Text numberOfLines={1} style={styles.sessionPickerMeta}>
+                      {formatDuration(session.durationMillis)}
+                      {session.fileSizeBytes ? ` · ${formatBytes(session.fileSizeBytes)}` : ''}
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color="#64748B" />
+                </TouchableOpacity>
+              ))
+            )}
+          </ScrollView>
+        </View>
+      </Modal>
       <Modal
         animationType="slide"
         visible={selectedPrediction !== null}
@@ -596,6 +934,25 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 24,
   },
+  listenButtonWrap: {
+    width: 276,
+    height: 276,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recordingPulse: {
+    position: 'absolute',
+    width: 226,
+    height: 226,
+    borderRadius: 113,
+    backgroundColor: 'rgba(239, 68, 68, 0.26)',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 113, 113, 0.34)',
+  },
+  recordingPulseDelayed: {
+    backgroundColor: 'rgba(56, 189, 248, 0.18)',
+    borderColor: 'rgba(56, 189, 248, 0.26)',
+  },
   listenButton: {
     width: 226,
     height: 226,
@@ -618,6 +975,11 @@ const styles = StyleSheet.create({
     borderColor: '#38BDF8',
     opacity: 0.78,
   },
+  listenButtonRecording: {
+    backgroundColor: '#7F1D1D',
+    borderColor: 'rgba(248, 113, 113, 0.48)',
+    shadowColor: '#EF4444',
+  },
   listenTitle: {
     color: '#F8FAFC',
     fontSize: 20,
@@ -629,6 +991,43 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
     fontWeight: '700',
     letterSpacing: 1,
+  },
+  recordingTimerText: {
+    color: '#FECACA',
+    fontSize: 22,
+    fontWeight: '900',
+  },
+  predictionActions: {
+    width: '100%',
+    maxWidth: 390,
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 18,
+  },
+  predictionActionButton: {
+    flex: 1,
+    minHeight: 48,
+    borderRadius: 14,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.22)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 10,
+  },
+  predictionActionButtonRecording: {
+    backgroundColor: 'rgba(239, 68, 68, 0.18)',
+    borderColor: 'rgba(248, 113, 113, 0.44)',
+  },
+  predictionActionButtonDisabled: {
+    opacity: 0.48,
+  },
+  predictionActionText: {
+    color: '#F8FAFC',
+    fontSize: 12,
+    fontWeight: '800',
   },
   messageBoxError: {
     width: '100%',
@@ -732,6 +1131,52 @@ const styles = StyleSheet.create({
   modalScreen: {
     flex: 1,
     backgroundColor: '#05060A',
+  },
+  sessionPickerContent: {
+    paddingHorizontal: 24,
+    gap: 12,
+  },
+  sessionPickerHelp: {
+    color: '#94A3B8',
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  sessionPickerEmpty: {
+    minHeight: 140,
+    borderRadius: 20,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  sessionPickerRow: {
+    minHeight: 72,
+    borderRadius: 18,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    padding: 14,
+  },
+  sessionPickerTextBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  sessionPickerTitle: {
+    color: '#F8FAFC',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  sessionPickerMeta: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 4,
   },
   modalCloseButton: {
     position: 'absolute',

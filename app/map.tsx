@@ -36,6 +36,16 @@ function formatDate(timestamp: number) {
   });
 }
 
+function getSessionDisplayName(session: { startedAt?: string; sessionId: string }) {
+  const timestamp = session.startedAt ? new Date(session.startedAt) : null;
+
+  if (timestamp && Number.isFinite(timestamp.getTime())) {
+    return `Session ${timestamp.toLocaleDateString([], { day: '2-digit', month: 'short' })}, ${timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  return session.sessionId;
+}
+
 function LoadingScreen({ title }: { title: string }) {
   const insets = useSafeAreaInsets();
 
@@ -154,11 +164,11 @@ export default function DatasetMapScreen() {
               longitude: session.longitude,
             }}
             pinColor="#38BDF8"
-            title={session.locationName}
+            title={getSessionDisplayName(session)}
           >
             <Callout tooltip={false}>
               <View style={styles.callout}>
-                <Text numberOfLines={1} style={styles.calloutTitle}>{session.locationName}</Text>
+                <Text numberOfLines={1} style={styles.calloutTitle}>{getSessionDisplayName(session)}</Text>
                 <Text style={styles.calloutText}>{formatDate(session.createdAt)}</Text>
                 <Text style={styles.calloutText}>Duration {formatDuration(session.durationMillis)}</Text>
               </View>
@@ -168,28 +178,28 @@ export default function DatasetMapScreen() {
       </MapView>
 
       <View pointerEvents="none" style={[styles.headerOverlay, { top: insets.top + 14 }]}>
-        <Text style={styles.heading}>Dataset map</Text>
+        <Text style={styles.heading}>Your collection map</Text>
         <Text style={styles.subtitle}>
-          {mapSessions ? `${mapSessions.length} collection point${mapSessions.length === 1 ? '' : 's'}` : 'Loading collection points'}
+          {mapSessions ? `${mapSessions.length} uploaded point${mapSessions.length === 1 ? '' : 's'}` : 'Loading your points'}
         </Text>
       </View>
 
       {mapSessions === undefined ? (
         <View style={styles.statusCard}>
           <ActivityIndicator size="small" color="#38BDF8" />
-          <Text style={styles.statusText}>Loading map points</Text>
+          <Text style={styles.statusText}>Loading your map points</Text>
         </View>
       ) : mapSessions.length === 0 ? (
         <View style={styles.statusCard}>
           <Ionicons name="map-outline" size={24} color="#38BDF8" />
           <Text style={styles.statusTitle}>No collection locations yet</Text>
-          <Text style={styles.statusText}>Uploaded sessions with location data will appear here.</Text>
+          <Text style={styles.statusText}>Your uploaded sessions with location data will appear here.</Text>
         </View>
       ) : null}
 
       <View pointerEvents="none" style={[styles.privacyBadge, { bottom: BOTTOM_NAV_HEIGHT + Math.max(insets.bottom, 10) + 12 }]}>
         <Ionicons name="shield-checkmark-outline" size={14} color="#BAE6FD" />
-        <Text style={styles.privacyText}>Locations are rounded for privacy</Text>
+        <Text style={styles.privacyText}>Only your rounded locations are shown</Text>
       </View>
 
       <BottomNav />

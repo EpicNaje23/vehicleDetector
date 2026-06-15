@@ -4,8 +4,10 @@ import { StatusBar } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth, useClerk, useUser } from '@clerk/clerk-expo';
+import { Link } from 'expo-router';
 import { BottomNav, BOTTOM_NAV_HEIGHT } from '@/components/BottomNav';
 import { ContributorAuthGate } from '@/components/ContributorAuthGate';
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole';
 
 const SUPPORT_EMAIL = 'jeanbaptiste.dindane@studio.unibo.it';
 const SUPPORT_LINKEDIN_URL = 'https://www.linkedin.com/in/jean-dindane-629a91304/';
@@ -16,6 +18,7 @@ export default function AccountScreen() {
   const { isLoaded, userId } = useAuth();
   const { signOut } = useClerk();
   const { user } = useUser();
+  const { isAdmin } = useCurrentUserRole();
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [supportMessage, setSupportMessage] = useState<string | null>(null);
   const displayName = user?.fullName ?? user?.username ?? 'Contributor';
@@ -81,6 +84,14 @@ export default function AccountScreen() {
             <>
               <Text numberOfLines={1} style={styles.title}>{displayName}</Text>
               {email ? <Text numberOfLines={1} style={styles.body}>{email}</Text> : null}
+              {isAdmin ? (
+                <Link href="/admin/users" asChild>
+                  <TouchableOpacity activeOpacity={0.86} style={styles.adminButton}>
+                    <Ionicons name="shield-checkmark-outline" size={18} color="#BAE6FD" />
+                    <Text style={styles.adminButtonText}>Manage users</Text>
+                  </TouchableOpacity>
+                </Link>
+              ) : null}
               <TouchableOpacity
                 activeOpacity={0.86}
                 disabled={isSigningOut}
@@ -183,6 +194,24 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingHorizontal: 18,
     marginTop: 10,
+  },
+  adminButton: {
+    minHeight: 44,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.28)',
+    backgroundColor: 'rgba(56, 189, 248, 0.10)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginTop: 8,
+  },
+  adminButtonText: {
+    color: '#BAE6FD',
+    fontSize: 13,
+    fontWeight: '900',
   },
   signOutText: {
     color: '#0F172A',
